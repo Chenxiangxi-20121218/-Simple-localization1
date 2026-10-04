@@ -1,0 +1,54 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- PyInstaller / 构建产物 ----
+.build/
+dist/
+*.spec
+
+# ---- 运行时数据与临时文件 ----
+.tmp/
+config.json
+
+# ---- 测试 / 预览生成物 ----
+preview/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- WorkBuddy 工作数据（本地记忆，不入库）----
+.workbuddy-ai/
