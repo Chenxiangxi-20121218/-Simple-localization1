@@ -41,7 +41,7 @@ class PacksPage(QWidget):
         title_txt = QVBoxLayout()
         title_txt.setSpacing(2)
         title_txt.addWidget(label("汉化包管理", obj="PageTitle"))
-        title_txt.addWidget(label("勾选表示启用，取消勾选表示禁用；点击「完成」应用更改",
+        title_txt.addWidget(label("按所选版本分别存放；勾选表示启用，点击「完成」应用到该版本的实例目录",
                                   obj="PageSub"))
         title_row.addLayout(title_txt)
         title_row.addStretch(1)
@@ -90,8 +90,8 @@ class PacksPage(QWidget):
         # ---------------------------------------------------- 5) 底部
         foot = QHBoxLayout()
         foot.setSpacing(12)
-        foot.addWidget(label("提示：启用的汉化包会被复制到 resourcepacks 并置于加载顺序末尾",
-                             obj="Hint", wrap=True), 1)
+        foot.addWidget(label("提示：启用的汉化包会复制到「所选版本实例」的 resourcepacks "
+                             "并置于加载顺序末尾", obj="Hint", wrap=True), 1)
         done_btn = IconButton("完成", "check", primary=True)
         done_btn.clicked.connect(self._finish)
         foot.addWidget(done_btn)
@@ -100,18 +100,25 @@ class PacksPage(QWidget):
         # ---------------------------------------------------- 信号订阅
         STATE.packsChanged.connect(self._on_packs_changed)
         STATE.gameDirChanged.connect(self.refresh)
+        STATE.versionChanged.connect(self.refresh)
 
         self.refresh()
 
     # ================================================================ 刷新
 
     def refresh(self) -> None:
-        """重新扫描汉化包目录并重建列表。"""
-        root = paths.hanhuabao_root(STATE.game_path())
+        """重新扫描**当前版本**的汉化包目录并重建列表。
+
+        汉化包按版本分开放（``versions/<版本>/汉化包``），所以切换版本后必须重扫，
+        否则会把别的版本的包列出来。
+        """
+        game = STATE.game_path()
+        version = STATE.current_version
+        root = paths.hanhuabao_root(game, version)
         self.path_label.setText(str(root))
         self._building = True
         try:
-            STATE.set_packs(packager.list_packs(root))
+            STATE.set_packs(packager.list_packs(game, version))
         finally:
             self._building = False
         self._rebuild()
@@ -175,12 +182,12 @@ class PacksPage(QWidget):
     # ================================================================ 其他动作
 
     def _open_dir(self) -> None:
-        d = paths.hanhuabao_root(STATE.game_path())
+        d = paths.hanhuabao_root(STATE.game_path(), STATE.current_version)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def _finish(self) -> None:
         """应用勾选结果，然后返回上一页。"""
-        packager.apply_enabled(STATE.game_path())
+        packager.apply_enabled(STATE.game_path(), STATE.current_version)
         k = sum(1 for p in STATE.packs if STATE.pack_enabled.get(p["id"], False))
         toast(self, f"已应用：启用 {k} 个汉化包")
         self.router.back()

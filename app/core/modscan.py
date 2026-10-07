@@ -36,6 +36,20 @@ _VERSION_SUFFIX_RE = re.compile(r"[-_+][vV]?\d[\w.+\-]*$")
 #: 版本号提取（用于从依赖范围里捞出第一个版本）
 _VER_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
 
+#: 结构定义：``data/<ns>/worldgen/structure/**.json``
+#: ⚠️ 只认 ``worldgen/structure``。``data/<ns>/structure/`` 是结构**模板**（.nbt 碎片）
+#: 的存放处，不是结构定义；混进来会凭空生成一批并不存在的「结构名」。
+_STRUCT_RE = re.compile(r"^data/([^/]+)/worldgen/structure/(.+)\.json$")
+
+#: 结构集：``data/<ns>/worldgen/structure_set/**.json`` —— 决定结构是否真的会生成
+_STRUCT_SET_RE = re.compile(r"^data/([^/]+)/worldgen/structure_set/(.+)\.json$")
+
+#: 成就定义：1.20 及以前在 ``data/<ns>/advancements/``，1.21+ 改名 ``advancement/``
+_ADV_RE = re.compile(r"^data/([^/]+)/advancements?/(.+)\.json$")
+
+#: 形如「正规语言键」的字符串（全小写 + 数字 + 下划线/点/连字符）
+_KEYLIKE_RE = re.compile(r"^[a-z0-9_.\-]+$")
+
 #: 图标缩放目标尺寸
 _ICON_SIZE = 64
 
@@ -218,6 +232,10 @@ def _blank(path_str: str) -> dict:
         "mc_version": "",
         "lang_files": [],
         "translatable": False,
+        #: 模组没提供、但游戏会去查的语言键：结构名 + 成就里误写成 translate 的英文句子
+        "extra_entries": {},
+        "extra_structures": 0,
+        "extra_advancements": 0,
         "error": "",
     }
 
@@ -285,7 +303,18 @@ def _fill(info: dict, zf: zipfile.ZipFile, jar: Path) -> None:
                     "format": fmt,
                 })
     info["lang_files"] = lang_files
-    info["translatable"] = bool(lang_files)
+
+    # ---- 附加键：结构名 + 成就里被误写成 translate 键的英文句子 ----
+    # 这些键模组自己没提供，但游戏（或探险者指南针）会去查：
+    #   * 结构名缺失 -> 指南针列表里显示原始 ID（如 terralith:glacial_hut）
+    #   * 成就标签缺失 -> 模组新增的成就分类显示英文
+    extra, n_struct, n_adv = _collect_extra_entries(
+        zf, names, names_set, lower_map, namespaces)
+    info["extra_entries"] = extra
+    info["extra_structures"] = n_struct
+    info["extra_advancements"] = n_adv
+    # 即使模组一个语言文件都没有，只要补得出附加键（例如只加结构的模组），也值得翻译
+    info["translatable"] = bool(lang_files) or bool(extra)
 
     # ---- 名称 ----
     en_name, cn_name = _resolve_names(
@@ -295,6 +324,147 @@ def _fill(info: dict, zf: zipfile.ZipFile, jar: Path) -> None:
 
     # ---- 图标 ----
     info["icon"] = _load_icon(zf, names_set, lower_map, namespaces)
+
+
+# ------------------------------------------------------------------ 附加键采集
+
+
+def _readable_from_path(path: str) -> str:
+    """把结构路径转成可读英文名：``cave/andesite_caves`` -> ``Cave Andesite Caves``。
+
+    结构本身没有任何「显示名」字段，游戏里能拿到的只有 ID；探险者指南针也是
+    直接拿 ID 去查语言表。所以英文名只能由 ID 还原。
+    """
+    words: list[str] = []
+    for seg in re.split(r"[/_]", str(path or "")):
+        seg = seg.strip()
+        if not seg:
+            continue
+        words.append(seg[:1].upper() + seg[1:])
+    return " ".join(words)
+
+
+def _referenced_structures(zf: zipfile.ZipFile, names: list[str]) -> set[str] | None:
+    """收集被结构集引用的结构 ID（``<ns>:<path>``）。
+
+    返回 ``None`` 表示「这个 jar 里一个结构集都没有」—— 调用方据此跳过过滤：
+    旧版本模组可能用别的放置方式，不能一律当成「永远不会生成」。
+    """
+    refs: set[str] = set()
+    found_set = False
+    for n in names:
+        if not _STRUCT_SET_RE.match(n):
+            continue
+        found_set = True
+        data = _load_json_bytes(_zip_read_bytes(zf, n))
+        if not isinstance(data, dict):
+            continue
+        entries = data.get("structures")
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if isinstance(e, dict) and isinstance(e.get("structure"), str):
+                refs.add(e["structure"])
+    return refs if found_set else None
+
+
+def _collect_extra_entries(zf: zipfile.ZipFile, names: list[str],
+                           names_set: set[str], lower_map: dict[str, str],
+                           namespaces: list[str]) -> tuple[dict[str, dict[str, str]], int, int]:
+    """收集「模组没提供、但游戏会去查」的语言键。
+
+    返回 ``({命名空间: {键: 英文原文}}, 结构数, 成就数)``。
+
+    两类来源：
+
+    1. **结构名** —— 键为 ``structure.<ns>.<路径，斜杠换成点>``。
+       这是探险者指南针（Explorer's Compass）查询结构名的键；原版语言文件里
+       一条都没有（实测 1.20.1 为 0 条），所以必须由资源包补，否则列表显示原始 ID。
+       **只为被结构集引用的结构起名**（未被引用的结构永远不会生成、指南针也定位不到）。
+
+    2. **成就里把英文句子误写成 translate 键** —— 例如 YUNG 系模组写的是
+       ``Component.translatable("An Ancient Tomb")`` 而不是 ``literal``。
+       此时「键」就是那句英文本身，只要补一条同键译文即可让游戏显示中文。
+       这类键同样覆盖模组新增成就的**分类标签**（根成就标题）。
+
+    ⚠️ 已经被模组自己提供（en_us 或 zh_cn）的键一律跳过；形如
+    ``advancements.nether.netherite_armor.title`` 的正规键也跳过 —— 它要么是
+    模组漏写（英文原文不可知），要么指向原版键（原版自带的中文比机器翻译好），
+    两种情况都不该由我们生成。
+    """
+    # 语言表在游戏里是全局合并的，任命名空间提供即算「已提供」；
+    # zh_cn 也纳入，避免把模组自带的中文名覆盖掉。
+    provided: set[str] = set()
+    for ns in namespaces:
+        for lang in ("en_us", "zh_cn"):
+            provided.update(_read_ns_lang(zf, names_set, lower_map, ns, lang).keys())
+
+    out: dict[str, dict[str, str]] = {}
+    n_struct = 0
+    n_adv = 0
+
+    # ---------------- 结构名 ----------------
+    # 只给「真的会被放置」的结构起名。结构集（worldgen/structure_set）是原版放置结构的
+    # 入口，没被任何结构集引用的结构永远不会自然生成，探险者指南针也定位不到 ——
+    # 给它起名只会让指南针列表里多出一堆永远找不到的条目。
+    # 实测 Terralith：145 个结构里 133 个是 start_pool=terralith:nothing 的内部占位符，
+    # 且 133 个全部未被任何结构集引用；社区汉化包也一条都没收 —— 这条规则能干净滤掉。
+    # 安全阀：整个 jar 一个结构集都没有时（旧版模组可能用别的放置方式）不过滤。
+    placed = _referenced_structures(zf, names)
+    for n in names:
+        m = _STRUCT_RE.match(n)
+        if not m:
+            continue
+        ns, path = m.group(1), m.group(2)
+        if not _NS_RE.match(ns) or not path:
+            continue
+        if placed is not None and f"{ns}:{path}" not in placed:
+            continue
+        key = f"structure.{ns}.{path.replace('/', '.')}"
+        if key in provided:
+            continue
+        en = _readable_from_path(path)
+        if not en:
+            continue
+        bucket = out.setdefault(ns, {})
+        if key in bucket:
+            continue
+        bucket[key] = en
+        n_struct += 1
+
+    # ---------------- 成就：误写成 translate 键的英文句子 ----------------
+    for n in names:
+        m = _ADV_RE.match(n)
+        if not m:
+            continue
+        ns = m.group(1)
+        if not _NS_RE.match(ns):
+            continue
+        data = _load_json_bytes(_zip_read_bytes(zf, n))
+        if not isinstance(data, dict):
+            continue
+        disp = data.get("display")
+        if not isinstance(disp, dict):
+            continue
+        for field in ("title", "description"):
+            node = disp.get(field)
+            if not isinstance(node, dict):
+                continue
+            val = node.get("translate")
+            if not isinstance(val, str):
+                continue
+            val = val.strip()
+            if not val or val in provided:
+                continue
+            if _KEYLIKE_RE.match(val):
+                continue      # 正规键：不是我们能补的（见 docstring）
+            bucket = out.setdefault(ns, {})
+            if val in bucket:
+                continue
+            bucket[val] = val
+            n_adv += 1
+
+    return out, n_struct, n_adv
 
 
 # ------------------------------------------------------------------ 元数据解析

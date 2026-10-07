@@ -305,7 +305,7 @@ class TranslatePage(QWidget):
 
         # 让界面立刻反馈：先建一次汉化包目录（worker 内也会做）
         try:
-            paths.hanhuabao_root(STATE.game_path())
+            paths.hanhuabao_root(STATE.game_path(), STATE.current_version)
         except OSError:
             pass
 
@@ -348,7 +348,8 @@ class TranslatePage(QWidget):
         self._done_label.setText(text)
         self._start_btn.setEnabled(STATE.can_translate())
         try:
-            STATE.set_packs(packager.list_packs(paths.hanhuabao_root(STATE.game_path())))
+            STATE.set_packs(packager.list_packs(STATE.game_path(),
+                                                STATE.current_version))
         except Exception:
             pass
 

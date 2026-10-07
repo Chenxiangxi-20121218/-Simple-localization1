@@ -69,8 +69,8 @@ class TranslateWorker(QThread):
         from . import modscan, packager, translator
 
         try:
-            # --- 0) 创建汉化包根目录（.versions/汉化包）---
-            root = paths.hanhuabao_root(Path(self.game_dir))
+            # --- 0) 创建汉化包目录（版本隔离 -> 落在所选版本的实例目录下）---
+            root = paths.hanhuabao_root(Path(self.game_dir), self.version)
             self.log.emit("已创建汉化包目录：" + str(root))
 
             # --- 1) 取翻译模型 ---
@@ -99,6 +99,14 @@ class TranslateWorker(QThread):
                 entries = self._read_mod_entries(modscan, mod)
                 collected.append((mod, entries))
                 total += sum(len(kv) for kv in entries.values())
+
+            # 附加键统计：让用户看得见「结构名 / 成就」这两类确实被处理了
+            n_struct = sum(int(m.get("extra_structures") or 0) for m, _ in collected)
+            n_adv = sum(int(m.get("extra_advancements") or 0) for m, _ in collected)
+            if n_struct or n_adv:
+                self.log.emit(
+                    f"已补充模组未提供的语言键：结构名 {n_struct} 条、"
+                    f"成就标题/描述 {n_adv} 条")
 
             done_count = 0
             t0 = time.time()
@@ -176,7 +184,14 @@ class TranslateWorker(QThread):
 
     @staticmethod
     def _read_mod_entries(modscan, mod: dict) -> dict[str, dict[str, str]]:
-        """读取一个模组全部 lang_files 的英文条目，返回 ``{namespace: {key: en}}``。"""
+        """读取一个模组的全部待翻译条目，返回 ``{namespace: {key: en}}``。
+
+        除了模组自带的 en_us 语言文件，还会并入扫描阶段补出来的「附加键」：
+        结构名（``structure.<ns>.<路径>``，探险者指南针据此显示）与
+        成就里被误写成 translate 键的英文句子（含模组新增成就的分类标签）。
+
+        附加键**只补空缺**，绝不覆盖模组自己提供的原文。
+        """
         entries: dict[str, dict[str, str]] = {}
         for lf in mod.get("lang_files") or []:
             ns = lf.get("namespace") or mod.get("modid") or ""
@@ -187,6 +202,15 @@ class TranslateWorker(QThread):
             if not data:
                 continue
             entries.setdefault(ns, {}).update(data)
+
+        extra = mod.get("extra_entries") or {}
+        if isinstance(extra, dict):
+            for ns, table in extra.items():
+                if not isinstance(table, dict) or not table:
+                    continue
+                bucket = entries.setdefault(str(ns), {})
+                for key, en in table.items():
+                    bucket.setdefault(str(key), str(en))
         return entries
 
     def _emit_progress(self, done_count: int, total: int, t0: float) -> None:

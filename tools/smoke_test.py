@@ -59,6 +59,10 @@ def make_game_dir() -> Path:
         _safe_rmtree(TMP)
     for v in ("1.20.1", "1.16.5"):
         (TMP / ".versions" / v / "mods").mkdir(parents=True, exist_ok=True)
+        # 模拟「版本隔离」实例：每个版本目录自带 options.txt 与 resourcepacks
+        (TMP / ".versions" / v / "options.txt").write_text(
+            f'version:{v}\nresourcePacks:["vanilla"]\nfov:0.0\n', encoding="utf-8")
+        (TMP / ".versions" / v / "resourcepacks").mkdir(parents=True, exist_ok=True)
     (TMP / "mods").mkdir(parents=True, exist_ok=True)
     (TMP / "resourcepacks").mkdir(parents=True, exist_ok=True)
     (TMP / "options.txt").write_text(
@@ -83,6 +87,50 @@ def make_jar(path: Path, modid: str, name: str) -> Path:
             f"gui.{modid}.title": "Welcome %s",
             f"mod.{modid}.name": name,
         }, ensure_ascii=False))
+    return path
+
+
+def make_extra_jar(path: Path, modid: str, name: str) -> Path:
+    """造一个含「结构 + 成就」的 jar，用于验证附加键采集。
+
+    - ``glacial_hut``   ：被结构集引用     -> 应补 ``structure.<modid>.glacial_hut``
+    - ``zpointer/taiga``：未被结构集引用   -> **不应**补（否则指南针出现找不到的条目）
+    - ``named_tower``   ：模组自带名字键   -> 不应覆盖
+    - 成就 ``root``     ：title 是英文句子 -> 应补同键（YUNG 系模组的写法）
+    - 成就 ``find``     ：用正规键且 en_us 已有 -> 不应生成
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("fabric.mod.json", json.dumps({
+            "schemaVersion": 1, "id": modid, "name": name, "version": "1.0.0",
+            "description": "extra test mod",
+        }))
+        z.writestr(f"assets/{modid}/lang/en_us.json", json.dumps({
+            f"mod.{modid}.name": name,
+            f"structure.{modid}.named_tower": "Named Tower",
+            f"advancements.{modid}.find.title": "Find It",
+            f"advancements.{modid}.find.description": "Find the thing",
+        }, ensure_ascii=False))
+        for p, pool in (("glacial_hut", "hut"), ("zpointer/taiga", "nothing"),
+                        ("named_tower", "tower")):
+            z.writestr(f"data/{modid}/worldgen/structure/{p}.json", json.dumps(
+                {"type": "minecraft:jigsaw", "start_pool": f"{modid}:{pool}"}))
+        # 结构集：只引用 glacial_hut 与 named_tower（zpointer/taiga 故意不引用）
+        z.writestr(f"data/{modid}/worldgen/structure_set/main.json", json.dumps({
+            "placement": {"type": "minecraft:random_spread", "spacing": 32, "separation": 8},
+            "structures": [{"structure": f"{modid}:glacial_hut", "weight": 1},
+                           {"structure": f"{modid}:named_tower", "weight": 1}],
+        }))
+        z.writestr(f"data/{modid}/advancements/root.json", json.dumps({
+            "display": {"title": {"translate": "An Ancient Tomb"},
+                        "description": {"translate": "Find the tomb"},
+                        "icon": {"item": "minecraft:stone"}},
+        }))
+        z.writestr(f"data/{modid}/advancements/find.json", json.dumps({
+            "display": {"title": {"translate": f"advancements.{modid}.find.title"},
+                        "description": {"translate": f"advancements.{modid}.find.description"},
+                        "icon": {"item": "minecraft:stone"}},
+        }))
     return path
 
 
@@ -165,7 +213,8 @@ def main() -> int:
     print("\n[3] 模组扫描")
     m = mods[0]
     for field in ("id", "modid", "namespaces", "cn_name", "en_name", "path",
-                  "icon", "loader", "mc_version", "lang_files", "translatable", "error"):
+                  "icon", "loader", "mc_version", "lang_files", "translatable", "error",
+                  "extra_entries", "extra_structures", "extra_advancements"):
         check(field in m, f"模组条目包含字段 {field}")
     check(m["loader"] == "fabric", f"loader 解析为 fabric（实际 {m['loader']}）")
     check(m["en_name"] != "", f"英文名非空：{m['en_name']}")
@@ -193,14 +242,18 @@ def main() -> int:
         check(True, "不存在的模型抛出 ModelError")
     check(translator.estimate_seconds(1000) > 0, "estimate_seconds 返回正数")
 
-    # ---------- 5. 汉化包目录创建（需求 1） ----------
+    # ---------- 5. 汉化包目录创建（按版本隔离） ----------
     print("\n[5] 汉化包目录")
     STATE.set_game_dir(str(game))
-    root = paths.hanhuabao_root(game)
-    check(root.is_dir() and root.name == "汉化包", f".versions 下创建「汉化包」目录：{root}")
-    check(root.parent.name in (".versions", "versions"), "汉化包目录位于 .versions 之下")
+    STATE.set_version("1.20.1")
+    root = paths.hanhuabao_root(game, "1.20.1")
+    check(root.is_dir() and root.name == "汉化包", f"创建「汉化包」目录：{root}")
+    check(root.parent.name == "1.20.1",
+          "汉化包目录位于所选版本实例之下（versions/1.20.1/汉化包）")
+    check(paths.hanhuabao_root(game).parent.name in (".versions", "versions"),
+          "不传版本时回落到版本根目录下的共享「汉化包」（兼容旧数据）")
 
-    # ---------- 6. 生成汉化包 + 启用/禁用 ----------
+    # ---------- 6. 生成汉化包 + 启用/禁用（版本隔离） ----------
     print("\n[6] 汉化包生成 / 启用 / 禁用")
     translated = {m["modid"]: {k: model.translate(v) for k, v in entries.items()}}
     names = {m["modid"]: {"cn": m["cn_name"], "en": m["en_name"]}}
@@ -214,27 +267,39 @@ def main() -> int:
     meta = json.loads((pdir / "pack.mcmeta").read_text(encoding="utf-8"))
     check("supported_formats" in meta["pack"], "pack.mcmeta 声明 supported_formats（全版本通用）")
 
-    listed = packager.list_packs(root)
+    listed = packager.list_packs(game, "1.20.1")
     check(any(p["id"] == pack["id"] for p in listed), "list_packs 能列出刚生成的包")
 
+    # 版本隔离：启用目标必须是版本实例目录，而不是游戏根目录
+    inst = game / ".versions" / "1.20.1"
+    check(paths.instance_dir(game, "1.20.1") == inst,
+          "instance_dir 识别出版本隔离实例目录")
+    check(paths.options_txt(game, "1.20.1") == inst / "options.txt",
+          "options_txt 指向版本实例的 options.txt（游戏真正读取的那份）")
+
     check(packager.enable_pack(game, pack), "enable_pack 返回 True")
-    options = (game / "options.txt").read_text(encoding="utf-8")
-    check(f"file/{pack['id']}" in options, "options.txt 中已写入 file/<包名>")
+    options = (inst / "options.txt").read_text(encoding="utf-8")
+    check(f"file/{pack['id']}" in options,
+          "版本实例 options.txt 中已写入 file/<包名>（游戏能读到）")
     rp = json.loads(options.split("resourcePacks:", 1)[1].split("\n", 1)[0])
     check(rp[-1] == f"file/{pack['id']}", "汉化包被置于 resourcePacks 列表末尾（覆盖原文）")
-    check((game / "resourcepacks" / pack["id"] / "pack.mcmeta").is_file(),
-          "汉化包已复制到 resourcepacks")
+    check((inst / "resourcepacks" / pack["id"] / "pack.mcmeta").is_file(),
+          "汉化包已复制到版本实例的 resourcepacks")
     check("fov:0.0" in options, "options.txt 其它行未被破坏")
+    root_options = (game / "options.txt").read_text(encoding="utf-8")
+    check(f"file/{pack['id']}" not in root_options,
+          "隔离实例下不污染游戏根目录 options.txt（避免跨版本串包）")
 
     packager.enable_pack(game, pack)          # 重复启用不应产生重复项
-    options = (game / "options.txt").read_text(encoding="utf-8")
+    options = (inst / "options.txt").read_text(encoding="utf-8")
     rp = json.loads(options.split("resourcePacks:", 1)[1].split("\n", 1)[0])
     check(rp.count(f"file/{pack['id']}") == 1, "重复启用不会产生重复条目")
 
     check(packager.disable_pack(game, pack), "disable_pack 返回 True")
-    options = (game / "options.txt").read_text(encoding="utf-8")
+    options = (inst / "options.txt").read_text(encoding="utf-8")
     check(f"file/{pack['id']}" not in options, "禁用后 options.txt 已移除该条目")
-    check(not (game / "resourcepacks" / pack["id"]).exists(), "禁用后 resourcepacks 目录已清理")
+    check(not (inst / "resourcepacks" / pack["id"]).exists(),
+          "禁用后版本实例的 resourcepacks 目录已清理")
 
     # ---------- 7. 目录名非法字符过滤 ----------
     print("\n[7] 目录名安全")
@@ -328,6 +393,67 @@ def main() -> int:
     check(not failed_logs, f"开启强化翻译后 worker 正常完成：{failed_logs}")
     check(any("强化翻译" in t for t in logs),
           f"worker 在强化翻译开启时输出提示日志：{[t for t in logs if '强化翻译' in t]}")
+
+    # ---------- 11. 结构与成就附加键 ----------
+    print("\n[11] 结构与成就附加键")
+    from app.core.worker import TranslateWorker
+
+    extra_dir = TMP / "extra_mods"
+    extra_dir.mkdir(parents=True, exist_ok=True)
+    make_extra_jar(extra_dir / "extra-1.0.jar", "extramod", "Extra Mod")
+    modscan.clear_cache()
+    emods = modscan.scan_mods([extra_dir])
+    em = next((x for x in emods if x.get("modid") == "extramod"), None)
+    check(em is not None, "能扫到含结构与成就的模组")
+    if em is not None:
+        table = (em.get("extra_entries") or {}).get("extramod", {})
+        check(table.get("structure.extramod.glacial_hut") == "Glacial Hut",
+              "被结构集引用的结构补出名字键 structure.extramod.glacial_hut")
+        check("structure.extramod.zpointer.taiga" not in table,
+              "未被结构集引用的结构不补名字键（指南针不会出现找不到的条目）")
+        check("structure.extramod.named_tower" not in table,
+              "模组已提供名字的结构键不被覆盖")
+        check(table.get("An Ancient Tomb") == "An Ancient Tomb",
+              "成就里误写成 translate 的英文句子补出同键")
+        check(table.get("Find the tomb") == "Find the tomb",
+              "成就描述同样补出")
+        check("advancements.extramod.find.title" not in table,
+              "指向正规键的成就不生成（原版键不该被覆盖）")
+        check(em.get("extra_structures") == 1,
+              f"结构计数正确（实际 {em.get('extra_structures')}）")
+        check(em.get("extra_advancements") == 2,
+              f"成就计数正确（实际 {em.get('extra_advancements')}）")
+
+        entries2 = TranslateWorker._read_mod_entries(modscan, em)
+        got = entries2.get("extramod", {})
+        check("structure.extramod.glacial_hut" in got,
+              "附加键被并入 worker 的待翻译条目")
+        check(got.get("structure.extramod.named_tower") == "Named Tower",
+              "worker 并入时保留模组自带的原文")
+
+        translated2 = {ns: {k: "【译】" + v for k, v in t.items()}
+                       for ns, t in entries2.items()}
+        pack2 = packager.create_pack(
+            TMP / ".versions" / "汉化包", "1.20.1", em, translated2,
+            {"extramod": {"cn": "附加键模组", "en": "Extra Mod"}})
+        check(not pack2.get("error"), f"含附加键的汉化包生成成功：{pack2.get('error', '')}")
+        if not pack2.get("error"):
+            pdir = Path(pack2["dir"])
+            fj = pdir / "assets" / "extramod" / "lang" / "zh_cn.json"
+            fl = pdir / "assets" / "extramod" / "lang" / "zh_cn.lang"
+            data2 = json.loads(fj.read_text(encoding="utf-8")) if fj.is_file() else {}
+            lang2: dict[str, str] = {}
+            if fl.is_file():
+                for line in fl.read_text(encoding="utf-8").splitlines():
+                    if "=" in line:
+                        k2, v2 = line.split("=", 1)
+                        lang2[k2] = v2
+            check(data2.get("structure.extramod.glacial_hut") == "【译】Glacial Hut",
+                  "zh_cn.json 里结构名键与译文正确")
+            check(lang2.get("structure.extramod.glacial_hut") == "【译】Glacial Hut",
+                  "zh_cn.lang 里结构名键与译文正确")
+            check(data2.get("An Ancient Tomb") == "【译】An Ancient Tomb",
+                  "zh_cn.json 里成就句子键与译文正确")
 
     # ---------- 收尾（先出结论，再做清理，避免清理失败吞掉结果） ----------
     print("\n" + "=" * 56)

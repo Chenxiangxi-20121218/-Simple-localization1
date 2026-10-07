@@ -131,6 +131,64 @@ def versions_dir(game_dir: Path) -> Path:
     return gd / ".versions"
 
 
+def version_bases(game_dir: Path) -> list[Path]:
+    """版本根目录候选（只返回真实存在的；都不存在时给出默认的 .versions）。"""
+    gd = Path(game_dir)
+    out: list[Path] = []
+    for name in (".versions", "versions"):
+        d = gd / name
+        if d.is_dir():
+            out.append(d)
+    return out or [gd / ".versions"]
+
+
+def version_instance_path(game_dir: Path, version: str | None) -> Path | None:
+    """版本实例目录的路径（只计算，不创建）；找不到返回 None。"""
+    if not version:
+        return None
+    for base in version_bases(game_dir):
+        d = base / version
+        if d.is_dir():
+            return d
+    return None
+
+
+def _is_isolated_instance(d: Path) -> bool:
+    """判断版本目录是否是一个「版本隔离」实例目录。
+
+    PCL2 / HMCL 开启版本隔离后，游戏的工作目录就是版本目录：``options.txt``、
+    ``saves``、``logs``、``mods`` 都落在里面。未开启隔离时这些东西只在游戏根目录，
+    版本目录里只有 ``<版本>.jar`` / ``<版本>.json``。
+
+    ⚠️ 不能只看 ``resourcepacks`` —— 启动器/整合包会预建这个空目录，
+    它不能证明隔离已开启。
+    """
+    for mark in ("options.txt", "saves", "logs"):
+        if (d / mark).exists():
+            return True
+    mods = d / "mods"
+    if mods.is_dir():
+        try:
+            if any(mods.iterdir()):
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def instance_dir(game_dir: Path, version: str | None = None) -> Path:
+    """该版本**实际生效**的游戏目录（版本隔离感知）。
+
+    开启版本隔离时返回 ``<游戏目录>/versions/<版本>/``；未开启（或版本目录不存在、
+    不像实例目录）时回落到游戏根目录。
+    """
+    gd = Path(game_dir)
+    d = version_instance_path(gd, version)
+    if d is not None and _is_isolated_instance(d):
+        return d
+    return gd
+
+
 def list_versions(game_dir: Path) -> list[str]:
     """列出当前游戏目录下可用的版本名（只认目录，排除汉化包与压缩包）。"""
     out: list[str] = []
@@ -181,30 +239,45 @@ def mods_dirs(game_dir: Path, version: str | None = None) -> list[Path]:
     return dirs
 
 
-def hanhuabao_root(game_dir: Path) -> Path:
-    """汉化包根目录：<游戏目录>/.versions/汉化包。
+def hanhuabao_root_path(game_dir: Path, version: str | None = None) -> Path:
+    """汉化包目录的路径（只计算，不创建）。
 
-    需求 1：点击「开始翻译」后在 .versions 下创建名为「汉化包」的文件夹，
-    当前版本的所有汉化包文件统一存放在此。
+    - 指定版本 -> ``<游戏目录>/versions/<版本>/汉化包``（与实例一一对应）
+    - 未指定   -> ``<游戏目录>/versions/汉化包``（历史共享目录，仅用于兼容读取）
     """
-    root = versions_dir(game_dir) / "汉化包"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    gd = Path(game_dir)
+    if version:
+        d = version_instance_path(gd, version)
+        if d is not None:
+            return d / "汉化包"
+        # 该版本还没安装：仍按 <版本>/汉化包 布局给出路径
+        return version_bases(gd)[0] / version / "汉化包"
+    return version_bases(gd)[0] / "汉化包"
 
 
-def hanhuabao_version_dir(game_dir: Path, version: str) -> Path:
-    """某个版本的汉化包目录：<游戏目录>/.versions/汉化包/<版本>。"""
-    d = hanhuabao_root(game_dir) / (version or "_default")
+def hanhuabao_root(game_dir: Path, version: str | None = None) -> Path:
+    """汉化包目录（会创建）。
+
+    需求 1 的修订：汉化包要放进**所选版本对应的实例目录**，即
+    ``<游戏目录>/versions/<版本>/汉化包``，而不是所有版本共用一个目录。
+    版本目录不存在时（未安装该版本）仍按 ``versions/<版本>/汉化包`` 创建。
+    """
+    d = hanhuabao_root_path(game_dir, version)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def resourcepacks_dir(game_dir: Path) -> Path:
-    """游戏资源包目录（汉化包启用时复制到这里）。"""
-    d = Path(game_dir) / "resourcepacks"
+def resourcepacks_dir(game_dir: Path, version: str | None = None) -> Path:
+    """游戏资源包目录（汉化包启用时复制到这里）。
+
+    版本隔离时位于 ``<版本实例>/resourcepacks`` —— 游戏只读这一份，
+    写到游戏根目录是无效的。
+    """
+    d = instance_dir(game_dir, version) / "resourcepacks"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def options_txt(game_dir: Path) -> Path:
-    return Path(game_dir) / "options.txt"
+def options_txt(game_dir: Path, version: str | None = None) -> Path:
+    """options.txt 路径（版本隔离时位于版本实例目录内）。"""
+    return instance_dir(game_dir, version) / "options.txt"

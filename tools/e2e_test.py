@@ -48,6 +48,10 @@ def setup() -> None:
         _safe_rmtree(GAME)
     for v in ("1.20.1", "1.16.5"):
         (GAME / ".versions" / v / "mods").mkdir(parents=True, exist_ok=True)
+        # 模拟「版本隔离」实例：每个版本目录自带 options.txt 与 resourcepacks
+        (GAME / ".versions" / v / "options.txt").write_text(
+            f'version:{v}\nresourcePacks:["vanilla"]\nfov:0.0\n', encoding="utf-8")
+        (GAME / ".versions" / v / "resourcepacks").mkdir(parents=True, exist_ok=True)
     (GAME / "mods").mkdir(parents=True, exist_ok=True)
     (GAME / "options.txt").write_text(
         'version:1.20.1\nresourcePacks:["vanilla","fabric"]\nfov:0.0\n', encoding="utf-8")
@@ -86,9 +90,10 @@ def main() -> int:
     assert len(mods) == 2, "应有 2 个可翻译模组"
     STATE.set_mods(mods)
 
-    root = paths.hanhuabao_root(GAME)
-    print(f"汉化包根目录：{root}")
-    assert root.name == "汉化包" and root.parent.name == ".versions"
+    root = paths.hanhuabao_root(GAME, "1.20.1")
+    print(f"汉化包目录：{root}")
+    assert root.name == "汉化包" and root.parent.name == "1.20.1", \
+        "汉化包应落在所选版本实例目录下（.versions/1.20.1/汉化包）"
 
     res = {"progress": [], "log": [], "leng": [], "done": None, "failed": None}
     loop = QEventLoop()
@@ -121,7 +126,7 @@ def main() -> int:
     assert all(a <= b for a, b in zip(res["progress"], res["progress"][1:])), "进度不单调"
     assert len(res["leng"]) >= 1, "冷知识未触发"
 
-    packs = packager.list_packs(root)
+    packs = packager.list_packs(GAME, "1.20.1")
     print(f"\n生成汉化包 {len(packs)} 个：")
     for p in packs:
         print(f"   - {p['name']}  ({p['count']} 条)  {p['dir']}")
@@ -151,12 +156,17 @@ def main() -> int:
     lang_txt = zl.read_text(encoding="utf-8")
     assert "block.demo.stone=石头方块" in lang_txt, ".lang 格式不正确"
 
-    # 启用一次，确认 options.txt
+    # 启用一次，确认写入了「版本实例」的 options.txt（版本隔离下游戏只读这一份）
     packager.enable_pack(GAME, demo)
-    options = (GAME / "options.txt").read_text(encoding="utf-8")
+    inst_opts = GAME / ".versions" / "1.20.1" / "options.txt"
+    options = inst_opts.read_text(encoding="utf-8")
     rp_line = options.split("resourcePacks:", 1)[1].split("\n", 1)[0]
     rp = json.loads(rp_line)
     assert rp[-1] == f"file/{demo['id']}", f"未置于加载顺序末尾：{rp}"
+    assert f"file/{demo['id']}" not in (GAME / "options.txt").read_text(encoding="utf-8"), \
+        "隔离实例下不应污染游戏根目录的 options.txt"
+    assert (GAME / ".versions" / "1.20.1" / "resourcepacks"
+            / demo["id"] / "pack.mcmeta").is_file(), "汉化包未复制到版本实例的 resourcepacks"
     assert "fov:0.0" in options, "options.txt 其它行被破坏"
     print(f"options.txt resourcePacks = {rp}")
 

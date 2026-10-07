@@ -115,7 +115,7 @@ def _make_real_packs(game: Path, mods: list[dict]) -> list[dict]:
     from app import paths
     from app.core import packager
 
-    root = paths.hanhuabao_root(game)
+    root = paths.hanhuabao_root(game, "1.20.1")
     for m in mods[:3]:
         ns = m["modid"]
         translated = {
@@ -128,7 +128,7 @@ def _make_real_packs(game: Path, mods: list[dict]) -> list[dict]:
         }
         names = {ns: {"cn": m["cn_name"], "en": m["en_name"]}}
         packager.create_pack(root, "1.20.1", m, translated, names)
-    return packager.list_packs(root)
+    return packager.list_packs(game, "1.20.1")
 
 
 def main() -> int:

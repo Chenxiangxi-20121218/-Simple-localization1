@@ -13,9 +13,14 @@
 ``pack.mcmeta`` 使用低 ``pack_format``（1）并声明 ``supported_formats`` 为 1~99：
 老版本会忽略不认识的字段，新版本也能正常读取，从而 1.0 ~ 最新快照通用。
 
-启用机制：把 pack 目录复制到 ``<game_dir>/resourcepacks/<pack_id>/``，
-并在 ``options.txt`` 的 ``resourcePacks:[...]`` 列表**末尾追加** ``"file/<pack_id>"``，
-使其位于加载顺序末尾、优先级最高，从而覆盖模组原文。
+启用机制：把 pack 目录复制到**版本实例**的 ``resourcepacks/<pack_id>/``，
+并在该实例的 ``options.txt`` 的 ``resourcePacks:[...]`` 列表**末尾追加**
+``"file/<pack_id>"``，使其位于加载顺序末尾、优先级最高，从而覆盖模组原文。
+
+⚠️ **版本隔离**：PCL2 / HMCL 等启动器开启版本隔离后，游戏的工作目录是
+``<游戏目录>/versions/<版本>/`` —— ``options.txt``、``resourcepacks``、
+``mods``、``saves`` 全在里面，游戏**只读那一份**。因此启用必须写到实例目录；
+写到游戏根目录是无效的（游戏根本不会加载）。
 """
 from __future__ import annotations
 
@@ -116,7 +121,8 @@ def create_pack(root: Path, version: str, mod: dict,
                 names: dict[str, dict[str, str]]) -> dict:
     """生成一个汉化包目录。
 
-    root       : 汉化包根目录（= paths.hanhuabao_root(game_dir)）
+    root       : 汉化包目录（= ``paths.hanhuabao_root(game_dir, version)``；
+                 版本隔离下即 ``<游戏目录>/versions/<版本>/汉化包``）
     version    : MC 版本名
     mod        : modscan.scan_mods() 返回的元素
     translated : {namespace: {key: 中文}}
@@ -248,18 +254,14 @@ def _parse_readme(text: str) -> dict:
     return info
 
 
-def _game_dir_from_root(root: Path) -> Path | None:
-    """由汉化包根目录反推游戏目录（<game>/.versions/汉化包 -> <game>）。"""
-    try:
-        return Path(root).parent.parent
-    except Exception:  # noqa: BLE001
-        return None
+def _read_resource_packs(game_dir: Path, version: str | None = None) -> list[str]:
+    """读取 options.txt 里的 resourcePacks 列表（失败返回空表）。
 
-
-def _read_resource_packs(game_dir: Path) -> list[str]:
-    """读取 options.txt 里的 resourcePacks 列表（失败返回空表）。"""
+    ⚠️ 版本隔离时必须读**版本实例目录**下的 options.txt：游戏只读那一份，
+    游戏根目录那份是无效的。
+    """
     try:
-        path = paths.options_txt(game_dir)
+        path = paths.options_txt(game_dir, version)
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -272,57 +274,83 @@ def _read_resource_packs(game_dir: Path) -> list[str]:
     return []
 
 
-def list_packs(root: Path) -> list[dict]:
-    """扫描 root 下的子目录，凡含 pack.mcmeta 的目录都算一个汉化包。"""
+def list_packs(game_dir: Path, version: str | None = None) -> list[dict]:
+    """扫描汉化包目录，凡含 pack.mcmeta 的子目录都算一个汉化包。
+
+    扫描两处：
+
+    - ``versions/<版本>/汉化包``（新布局，与版本实例一一对应）
+    - ``versions/汉化包``（历史共享目录，兼容此前生成的数据）
+
+    每个包的「是否已启用」按它自己的 ``MC版本`` 去对应实例的 options.txt 里查 ——
+    版本隔离下每个实例有独立的 options.txt，不能只看游戏根目录那一份。
+    """
     packs: list[dict] = []
     try:
-        root = Path(root)
-        if not root.is_dir():
-            return packs
-        game_dir = _game_dir_from_root(root)
-        enabled_list = _read_resource_packs(game_dir) if game_dir else []
+        gd = Path(game_dir)
+        roots: list[Path] = []
+        if version:
+            roots.append(paths.hanhuabao_root_path(gd, version))
+        legacy = paths.hanhuabao_root_path(gd, None)
+        if legacy not in roots:
+            roots.append(legacy)
 
-        for child in root.iterdir():
-            try:
-                if not child.is_dir():
-                    continue
-                if not (child / "pack.mcmeta").is_file():
-                    continue
+        enabled_cache: dict[str, list[str]] = {}
 
-                info = {"modid": "", "version": "", "count": 0, "namespaces": [], "cn": ""}
-                readme = child / "README.txt"
-                if readme.is_file():
-                    try:
-                        info = _parse_readme(readme.read_text(encoding="utf-8",
-                                                             errors="replace"))
-                    except OSError:
-                        pass
+        def _enabled_for(ver: str) -> list[str]:
+            if ver not in enabled_cache:
+                enabled_cache[ver] = _read_resource_packs(gd, ver or None)
+            return enabled_cache[ver]
 
-                pack_id = child.name
-                ns_count = len(info["namespaces"])
-                count = int(info["count"] or 0)
-                date_str = ""
-                try:
-                    date_str = datetime.fromtimestamp(
-                        (child / "pack.mcmeta").stat().st_mtime).strftime("%Y-%m-%d")
-                except OSError:
-                    date_str = ""
-
-                display = f"{info['cn']} 汉化包" if info["cn"] else pack_id
-                enabled = (f"file/{pack_id}" in enabled_list) or (pack_id in enabled_list)
-
-                packs.append({
-                    "id": pack_id,
-                    "name": display,
-                    "detail": f"{ns_count} 个命名空间 · {count} 条译文 · {date_str}",
-                    "dir": str(child),
-                    "version": info["version"],
-                    "modid": info["modid"],
-                    "enabled": bool(enabled),
-                    "count": count,
-                })
-            except Exception:  # noqa: BLE001 —— 单个目录失败不影响整体
+        for root in roots:
+            if not root.is_dir():
                 continue
+            for child in root.iterdir():
+                try:
+                    if not child.is_dir():
+                        continue
+                    if not (child / "pack.mcmeta").is_file():
+                        continue
+
+                    info = {"modid": "", "version": "", "count": 0,
+                            "namespaces": [], "cn": ""}
+                    readme = child / "README.txt"
+                    if readme.is_file():
+                        try:
+                            info = _parse_readme(readme.read_text(
+                                encoding="utf-8", errors="replace"))
+                        except OSError:
+                            pass
+
+                    pack_id = child.name
+                    ns_count = len(info["namespaces"])
+                    count = int(info["count"] or 0)
+                    try:
+                        date_str = datetime.fromtimestamp(
+                            (child / "pack.mcmeta").stat().st_mtime).strftime("%Y-%m-%d")
+                    except OSError:
+                        date_str = ""
+
+                    # 启用状态按该包自己的 MC 版本查对应实例的 options.txt
+                    ver = str(info["version"] or version or "")
+                    enabled_list = _enabled_for(ver)
+                    enabled = ((f"file/{pack_id}" in enabled_list)
+                               or (pack_id in enabled_list))
+
+                    display = f"{info['cn']} 汉化包" if info["cn"] else pack_id
+
+                    packs.append({
+                        "id": pack_id,
+                        "name": display,
+                        "detail": f"{ns_count} 个命名空间 · {count} 条译文 · {date_str}",
+                        "dir": str(child),
+                        "version": info["version"],
+                        "modid": info["modid"],
+                        "enabled": bool(enabled),
+                        "count": count,
+                    })
+                except Exception:  # noqa: BLE001 —— 单个目录失败不影响整体
+                    continue
     except Exception:  # noqa: BLE001
         return packs
 
@@ -363,15 +391,18 @@ def _dump_list(entries: list[str]) -> str:
     return json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
 
 
-def _edit_resource_packs(game_dir: Path, pack_id: str, add: bool) -> bool:
-    """在 options.txt 的 resourcePacks 列表中增删 ``file/<pack_id>``。
+def _edit_resource_packs(path: Path, pack_id: str, add: bool) -> bool:
+    """在指定 options.txt 的 resourcePacks 列表中增删 ``file/<pack_id>``。
 
     - add=True ：先移除已存在项，再追加到列表末尾（保证加载顺序靠后）。
     - add=False：仅移除该项（含裸 pack_id 形式）。
     逐行处理、保留其它行原样（含 CRLF）。返回是否成功。
+
+    直接接收 options.txt 路径（而非游戏目录）：版本隔离下每个实例各有一份
+    options.txt，调用方需要能精确指定写哪一份。
     """
     try:
-        path = paths.options_txt(game_dir)
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if path.is_file():
@@ -417,39 +448,76 @@ def _edit_resource_packs(game_dir: Path, pack_id: str, add: bool) -> bool:
 # ---------------------------------------------------------------- 启用 / 禁用
 
 
+def _pack_targets(game_dir: Path, version: str | None) -> list[Path]:
+    """该汉化包应当生效的目标目录列表（去重、保持顺序）。
+
+    1. **版本实例目录** ``<游戏目录>/versions/<版本>/`` —— 开启版本隔离时，
+       游戏的工作目录就是它，options.txt 与 resourcepacks 只认这一份。
+    2. **游戏根目录** —— 仅当版本目录存在但**不像隔离实例**时补上，兼容
+       「没开隔离」的老式布局（此时两处都写，哪种布局都能加载）。
+
+    判定为隔离实例时**不写**游戏根目录，避免把某个版本的汉化包串到别的版本上。
+    """
+    gd = Path(game_dir)
+    out: list[Path] = []
+    vd = paths.version_instance_path(gd, version)
+    if vd is not None:
+        out.append(vd)
+    if paths.instance_dir(gd, version) == gd:
+        out.append(gd)
+    return out or [gd]
+
+
 def enable_pack(game_dir: Path, pack: dict) -> bool:
-    """把 pack 复制到 resourcepacks 并在 options.txt 末尾启用。返回 bool。"""
+    """把 pack 复制到目标实例的 resourcepacks，并在其 options.txt 末尾启用。
+
+    目标实例由 pack 自己的 ``MC版本`` 决定（见 :func:`_pack_targets`）。
+    """
     try:
         pack = pack or {}
         pack_id = str(pack.get("id") or "")
         src = Path(str(pack.get("dir") or ""))
+        version = str(pack.get("version") or "") or None
         if not pack_id or not src.is_dir():
             return False
 
-        dest = paths.resourcepacks_dir(game_dir) / pack_id
-        shutil.copytree(src, dest, dirs_exist_ok=True)
-
-        if not _edit_resource_packs(game_dir, pack_id, add=True):
-            return False
-        return True
+        ok = False
+        for target in _pack_targets(game_dir, version):
+            dest = target / "resourcepacks" / pack_id
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+            if _edit_resource_packs(target / "options.txt", pack_id, add=True):
+                ok = True
+        return ok
     except Exception:  # noqa: BLE001
         return False
 
 
 def disable_pack(game_dir: Path, pack: dict) -> bool:
-    """从 options.txt 移除该 pack，并删除 resourcepacks 里的副本。返回 bool。"""
+    """从目标实例的 options.txt 移除该 pack，并删除 resourcepacks 里的副本。
+
+    同时清理游戏根目录里的同名残留 —— 旧实现把包写到了根目录，这里顺手纠正。
+    """
     try:
         pack = pack or {}
         pack_id = str(pack.get("id") or "")
+        version = str(pack.get("version") or "") or None
         if not pack_id:
             return False
 
-        ok = _edit_resource_packs(game_dir, pack_id, add=False)
-        try:
-            dest = paths.resourcepacks_dir(game_dir) / pack_id
-            shutil.rmtree(dest, ignore_errors=True)
-        except OSError:
-            pass
+        targets = _pack_targets(game_dir, version)
+        gd = Path(game_dir)
+        if gd not in targets:
+            targets.append(gd)          # 清理旧的根目录残留
+
+        ok = False
+        for target in targets:
+            if _edit_resource_packs(target / "options.txt", pack_id, add=False):
+                ok = True
+            try:
+                shutil.rmtree(target / "resourcepacks" / pack_id, ignore_errors=True)
+            except OSError:
+                pass
         return bool(ok)
     except Exception:  # noqa: BLE001
         return False
@@ -458,8 +526,11 @@ def disable_pack(game_dir: Path, pack: dict) -> bool:
 # ---------------------------------------------------------------- 批量同步
 
 
-def apply_enabled(game_dir: Path) -> None:
+def apply_enabled(game_dir: Path, version: str | None = None) -> None:
     """按 STATE.pack_enabled 批量启用/禁用，并同步 options.txt。
+
+    每个包按其自身的 ``MC版本`` 落到对应实例目录（版本隔离下每个实例各有
+    一份 options.txt），因此这里必须按版本枚举汉化包。
 
     为避免信号风暴，这里直接改 ``STATE.pack_enabled`` 字典，最后只 ``save()`` 一次，
     不逐条 emit ``packsChanged``。
@@ -467,8 +538,7 @@ def apply_enabled(game_dir: Path) -> None:
     from ..state import STATE
 
     try:
-        root = paths.hanhuabao_root(game_dir)
-        for pack in list_packs(root):
+        for pack in list_packs(game_dir, version):
             pid = pack["id"]
             want = bool(STATE.pack_enabled.get(pid, False))
             if want:
