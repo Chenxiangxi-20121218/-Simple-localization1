@@ -15,7 +15,7 @@ from . import paths
 from .theme import C, apply_accent
 
 #: 程序版本号 x.y.z —— x 大版本 / y 小更新 / z 维护版（每次更新递增，见 tools/bump_version.py）
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 
 DEFAULT_WELCOME = "欢迎使用 minecraft 模组汉化工具"
 DEFAULT_TRANSLATOR_TITLE = "MC 模组汉化工具"

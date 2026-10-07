@@ -71,7 +71,21 @@ def make_game_dir() -> Path:
     make_jar(TMP / ".versions" / "1.20.1" / "mods" / "demo-1.0.0.jar", "demo", "Demo Mod")
     make_jar(TMP / ".versions" / "1.16.5" / "mods" / "legacy-2.0.jar", "legacy", "Legacy Mod")
     (TMP / ".versions" / "1.20.1" / "mods" / "broken.jar").write_bytes(b"not a zip at all")
+    # 版本实例 jar：里面 version.json 的 pack_version 是资源包格式号最权威的来源
+    make_version_jar(TMP / ".versions" / "1.16.5", "1.16.5", 6)
     return TMP
+
+
+def make_version_jar(inst: Path, name: str, pack_format: int) -> Path:
+    """造一个「版本实例 jar」，只含 version.json（模拟原版客户端 jar）。"""
+    inst.mkdir(parents=True, exist_ok=True)
+    path = inst / f"{name}.jar"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("version.json", json.dumps({
+            "id": name, "world_version": 0,
+            "pack_version": {"resource": pack_format, "data": pack_format},
+        }))
+    return path
 
 
 def make_jar(path: Path, modid: str, name: str) -> Path:
@@ -265,7 +279,39 @@ def main() -> int:
     check((pdir / "assets" / m["modid"] / "lang" / "zh_cn.lang").is_file(),
           "生成 zh_cn.lang（1.13 以前版本兼容）")
     meta = json.loads((pdir / "pack.mcmeta").read_text(encoding="utf-8"))
-    check("supported_formats" in meta["pack"], "pack.mcmeta 声明 supported_formats（全版本通用）")
+    check(meta["pack"].get("pack_format") == 15,
+          f"pack.mcmeta 的 pack_format 按 1.20.1 写入 15（实际 {meta['pack'].get('pack_format')}）")
+    check(meta["pack"].get("supported_formats")
+          == {"min_inclusive": 1, "max_inclusive": 64},
+          "pack.mcmeta 用 supported_formats 覆盖 1.0~1.21.8（旧字段上界=1.21.8）")
+    check(meta["pack"].get("min_format") == 1 and meta["pack"].get("max_format") == 999,
+          "pack.mcmeta 同时声明 min_format / max_format（跨 1.21.9 时代）")
+
+    # pack.mcmeta 的格式号必须随目标版本走，否则游戏里会显示为「不兼容」（红色）
+    inst165 = TMP / ".versions" / "1.16.5"
+    check(packager.detect_pack_format(inst165, "1.16.5") == (6, 0),
+          "detect_pack_format 读实例 jar 的 version.json（1.16.5 -> 6）")
+    p165 = packager.create_pack(paths.hanhuabao_root(game, "1.16.5"), "1.16.5",
+                                m, translated, names)
+    if "error" not in p165:
+        m165 = json.loads((Path(p165["dir"]) / "pack.mcmeta").read_text(encoding="utf-8"))
+        check(m165["pack"].get("pack_format") == 6,
+              f"1.16.5 的包写 pack_format 6（实际 {m165['pack'].get('pack_format')}）")
+    p_new = packager.create_pack(paths.hanhuabao_root(game, "1.21.11"), "1.21.11",
+                                 m, translated, names)
+    if "error" not in p_new:
+        m_new = json.loads((Path(p_new["dir"]) / "pack.mcmeta").read_text(encoding="utf-8"))
+        check("pack_format" not in m_new["pack"] and "supported_formats" not in m_new["pack"],
+              "1.21.9+ 的包不写 pack_format / supported_formats（写了会报错）")
+        check(m_new["pack"].get("min_format") == [65, 0]
+              and m_new["pack"].get("max_format") == 999,
+              "1.21.9+ 的包改用 min_format / max_format")
+    check(packager.detect_pack_format(None, "26.1.1") == (65, 0),
+          "detect_pack_format：26.1.1 走年份版本 -> 新时代")
+    check(packager.detect_pack_format(None, "1.20.1-Forge_47.4.16") == (15, 0),
+          "detect_pack_format：从 '1.20.1-Forge_47.4.16' 里认出 1.20.1")
+    check(packager.detect_pack_format(None, "Construction & Exploration v1.1.0") == (15, 0),
+          "detect_pack_format：整合包名里的 v1.1.0 不被误认，回落兜底 15")
 
     listed = packager.list_packs(game, "1.20.1")
     check(any(p["id"] == pack["id"] for p in listed), "list_packs 能列出刚生成的包")

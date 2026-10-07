@@ -10,8 +10,18 @@
 - ``zh_cn.json``  —— 1.13 及以后（JSON 键值对）
 - ``zh_cn.lang``  —— 1.13 以前（每行 ``key=value`` 纯文本）
 
-``pack.mcmeta`` 使用低 ``pack_format``（1）并声明 ``supported_formats`` 为 1~99：
-老版本会忽略不认识的字段，新版本也能正常读取，从而 1.0 ~ 最新快照通用。
+``pack.mcmeta`` 里的资源包格式号（``pack_format``）**必须与目标 MC 版本匹配**，
+否则游戏会把汉化包显示为**红色（不兼容）**：
+
+- 1.20.1 及以前：只认 ``pack_format``，且要求**完全相等**（1.20.1 -> 15）。
+  写死 ``pack_format: 1``（那是 1.6.1~1.8.9 的格式号）就会变红。
+- 1.20.2 ~ 1.21.8：改看 ``supported_formats`` 区间。
+- 1.21.9（25w31a）及以后：``pack_format`` / ``supported_formats`` **被废弃**，
+  改用 ``min_format`` / ``max_format``；跨这两个时代的包必须同时写新旧字段。
+
+因此格式号按**目标版本**动态计算：优先读版本实例 jar 里的 ``version.json`` ->
+``pack_version.resource``（最权威），读不到再按版本名查表。详见
+:func:`detect_pack_format` 与 :func:`build_pack_mcmeta`。
 
 启用机制：把 pack 目录复制到**版本实例**的 ``resourcepacks/<pack_id>/``，
 并在该实例的 ``options.txt`` 的 ``resourcePacks:[...]`` 列表**末尾追加**
@@ -49,6 +59,221 @@ _RE_MCVER = re.compile(r"^MC版本:\s*(.*)$")
 _RE_COUNT = re.compile(r"^译文条数:\s*(\d+)$")
 _RE_NAMESPACES = re.compile(r"^命名空间:\s*(.*)$")
 _RE_MODNAME = re.compile(r"^模组名称:\s*(.*)$")
+
+
+# ---------------------------------------------------------------- 资源包格式号
+#
+# ⚠️ 为什么必须按版本算格式号：MC 会拿 pack.mcmeta 里的格式号与**自己**的格式号
+# 比对，不一致就把资源包显示成红色（不兼容）。各版本的规则还不一样：
+#
+#   · ≤ 1.20.1       只读 pack_format，要求**完全相等**（1.20.1 = 15）
+#   · 1.20.2~1.21.8  读 supported_formats 区间
+#   · ≥ 1.21.9       旧字段被 min_format / max_format 取代，跨时代需同时写两套
+#
+# 历史 bug：这里曾写死 ``pack_format: 1`` + ``supported_formats: [1, 99]``，
+# 以为「老版本会忽略不认识的字段」就万事大吉 —— 但 1.20.1 根本不认识
+# supported_formats，只看到 pack_format=1 ≠ 15，于是所有汉化包全变红。
+
+#: 「新时代」下界：1.21.9（25w31a）的资源包格式号（快照 65 / 正式版 69）
+_NEW_ERA_MAJOR = 65
+
+#: 旧字段 supported_formats 的上界 = 1.21.8 的格式号（最后一个用旧字段的版本）
+_OLD_ERA_MAX_MAJOR = 64
+
+#: 新字段 max_format 的上界，声明「及以后都支持」
+_FUTURE_MAJOR = 999
+
+#: 认不出目标版本时的兜底格式号（1.20.1；用户主力版本，且 ≥1.20.2 也能靠区间兜住）
+_FALLBACK_MAJOR = 15
+
+#: 版本名 -> 资源包格式号（仅在读不到 version.json 时兜底；新版本请补表）
+_PACK_FORMAT_TABLE: tuple[tuple[tuple[int, int, int], int], ...] = (
+    ((1, 21, 11), 75), ((1, 21, 9), 69), ((1, 21, 7), 64), ((1, 21, 6), 63),
+    ((1, 21, 5), 55), ((1, 21, 4), 46), ((1, 21, 2), 42), ((1, 21, 0), 34),
+    ((1, 20, 5), 32), ((1, 20, 3), 22), ((1, 20, 2), 18), ((1, 20, 0), 15),
+    ((1, 19, 4), 13), ((1, 19, 3), 12), ((1, 19, 0), 9), ((1, 18, 0), 8),
+    ((1, 17, 0), 7), ((1, 16, 2), 6), ((1, 15, 0), 5), ((1, 13, 0), 4),
+    ((1, 11, 0), 3), ((1, 9, 0), 2), ((1, 6, 0), 1),
+)
+
+#: 版本号片段，如 ``1.20.1`` / ``26.1.1``
+_RE_VERSION_TOKEN = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+#: 版本实例 jar 名里的 MC 版本号，如 ``1.20.1fabric.jar`` / ``PuzzlesLib-v8.1.33-1.20.1-Fabric.jar``
+#: 前后不允许紧邻数字或点，避免把 ``8.1.33`` 里的 ``1.33`` 当成版本号
+_RE_JAR_MCVER = re.compile(r"(?<![\d.])(1\.\d+(?:\.\d+)?)(?![\d.])")
+
+
+def _parse_version_tuple(text: str) -> tuple[int, int, int] | None:
+    """从任意文本里挑出最像 MC 版本号的片段，返回 ``(主, 次, 修订)``。
+
+    只接受 ``1.6`` ~ ``1.99``，或**位于开头**的 ``26.1`` 这类年份版本
+    （Mojang 2026 起改用年份版本号）。这样既能认 ``1.20.1-Forge_47.4.16``，
+    又不会把整合包名里的 ``v1.1.0``、Forge 的 ``47.4.16`` 当成 MC 版本。
+    """
+    for m in _RE_VERSION_TOKEN.finditer(str(text or "")):
+        parts = [int(p) for p in m.group(0).split(".")]
+        while len(parts) < 3:
+            parts.append(0)
+        major, minor, patch = parts[0], parts[1], parts[2]
+        if major == 1 and 6 <= minor <= 99:
+            return (major, minor, patch)
+        if m.start() == 0 and 26 <= major <= 99:   # 年份版本 26.1 / 26.2 ...
+            return (major, minor, patch)
+    return None
+
+
+def _format_from_version_name(name: str) -> int | None:
+    """版本名 -> 资源包格式号（查表；年份版本一律算「新时代」）。"""
+    ver = _parse_version_tuple(name)
+    if ver is None:
+        return None
+    major, minor, _patch = ver
+    if major >= 2:                      # 26.1 之类的年份版本
+        return _NEW_ERA_MAJOR
+    for start, fmt in _PACK_FORMAT_TABLE:
+        if ver >= start:
+            return fmt
+    return None
+
+
+def _format_from_jar(jar: Path) -> tuple[int, int] | None:
+    """读版本实例 jar 内 ``version.json`` 的 ``pack_version``（最权威的来源）。
+
+    - ``{"resource": 15}``                     —— ≤1.20.1 的单整数
+    - ``{"resource_major": 75, "resource_minor": 0}`` —— ≥1.21.9 的主次版本
+    """
+    try:
+        import zipfile
+        with zipfile.ZipFile(jar) as z:
+            if "version.json" not in z.namelist():
+                return None
+            data = json.loads(z.read("version.json").decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 —— 坏 jar / 非 zip 一律当读不到
+        return None
+    pv = data.get("pack_version") if isinstance(data, dict) else None
+    if isinstance(pv, dict):
+        res = pv.get("resource")
+        if isinstance(res, int):
+            return (res, 0)
+        res_major = pv.get("resource_major")
+        if isinstance(res_major, int):
+            minor = pv.get("resource_minor")
+            return (res_major, minor if isinstance(minor, int) else 0)
+    return None
+
+
+def detect_pack_format(instance: Path | None = None,
+                       version: str | None = None) -> tuple[int, int]:
+    """探测目标 MC 版本的资源包格式号，返回 ``(主版本号, 次版本号)``。
+
+    按可靠性依次尝试：
+
+    1. 版本实例 jar 里的 ``version.json`` -> ``pack_version``（PCL2 / HMCL 都会放）
+    2. 版本实例 json 的 ``inheritsFrom`` / ``id``（Forge / Fabric 实例常用）
+    3. 版本名本身（``1.20.1`` / ``1.20.1fabric`` / ``1.20.1-Forge_47.4.16``）
+    4. 实例 ``mods/*.jar`` 文件名里的 MC 版本（整合包实例名千奇百怪时的兜底）
+
+    全部失败时返回 :data:`_FALLBACK_MAJOR`（1.20.1）。
+    """
+    # 1) 实例 jar
+    if instance is not None and Path(instance).is_dir():
+        inst = Path(instance)
+        jars: list[Path] = []
+        if version:
+            same = inst / f"{version}.jar"
+            if same.is_file():
+                jars.append(same)
+        try:
+            jars.extend(j for j in sorted(inst.glob("*.jar")) if j not in jars)
+        except OSError:
+            pass
+        for jar in jars:
+            fmt = _format_from_jar(jar)
+            if fmt:
+                return fmt
+
+        # 2) 实例 json
+        try:
+            jsons = [j for j in sorted(inst.glob("*.json")) if j.name != "launcher_profiles.json"]
+        except OSError:
+            jsons = []
+        for js in jsons:
+            try:
+                data = json.loads(js.read_text(encoding="utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            for key in ("inheritsFrom", "id"):
+                fmt = _format_from_version_name(str(data.get(key) or ""))
+                if fmt:
+                    return (fmt, 0)
+
+        # 4) mods 文件名（整合包实例名千奇百怪、又没有 jar/json 时的兜底）
+        try:
+            mods = inst / "mods"
+            if mods.is_dir():
+                for jar in sorted(mods.glob("*.jar")):
+                    for cand in _RE_JAR_MCVER.findall(jar.name):
+                        fmt = _format_from_version_name(cand)
+                        if fmt:
+                            return (fmt, 0)
+        except OSError:
+            pass
+
+    # 3) 版本名本身
+    fmt = _format_from_version_name(version or "")
+    if fmt:
+        return (fmt, 0)
+
+    return (_FALLBACK_MAJOR, 0)
+
+
+def build_pack_mcmeta(description: str, fmt: tuple[int, int]) -> dict:
+    """按目标格式号构造 pack.mcmeta 内容。
+
+    - 目标 ≥ 1.21.9：只能写 ``min_format`` / ``max_format``（写旧字段会报错）
+    - 目标 < 1.21.9：``pack_format`` 写目标版本的真实格式号（≤1.20.1 靠它精确匹配），
+      并用 ``supported_formats`` 覆盖 1.0~1.21.8，再用新字段覆盖 1.21.9+
+      —— 跨新旧两个时代的包，两套字段都必须写。
+
+    老版本会**忽略**自己不认识的字段（实测 1.20.1 里带 ``supported_formats`` 的包
+    仍能正常解析出 description，只是 pack_format 不匹配才变红），所以多写新字段无害。
+    """
+    major, minor = fmt
+    if (major, minor) >= (_NEW_ERA_MAJOR, 0):
+        return {"pack": {
+            "description": description,
+            "min_format": [_NEW_ERA_MAJOR, 0],
+            "max_format": _FUTURE_MAJOR,
+        }}
+    return {"pack": {
+        "description": description,
+        "pack_format": major,
+        "supported_formats": {"min_inclusive": 1, "max_inclusive": _OLD_ERA_MAX_MAJOR},
+        "min_format": 1,
+        "max_format": _FUTURE_MAJOR,
+    }}
+
+
+def instance_of_pack(pack_dir: Path) -> Path | None:
+    """由汉化包目录反推它所属的版本实例目录。
+
+    认两种布局：
+
+    - ``<游戏>/versions/<版本>/汉化包/<包名>``      -> ``<游戏>/versions/<版本>``
+    - ``<游戏>/versions/<版本>/resourcepacks/<包名>`` -> ``<游戏>/versions/<版本>``
+
+    识别不出来（如历史共享的 ``versions/汉化包``）时返回 None。
+    """
+    try:
+        inst = Path(pack_dir).resolve().parent.parent
+    except OSError:
+        return None
+    if inst.parent.name in ("versions", ".versions"):
+        return inst
+    return None
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -154,14 +379,10 @@ def create_pack(root: Path, version: str, mod: dict,
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 1) pack.mcmeta —— 低 pack_format + supported_formats，保证全版本通用
-        mcmeta = {
-            "pack": {
-                "pack_format": 1,
-                "description": f"§b{cn_name} 汉化包 {_DESC_SUFFIX}",
-                "supported_formats": {"min_inclusive": 1, "max_inclusive": 99},
-            }
-        }
+        # 1) pack.mcmeta —— 格式号必须与目标 MC 版本匹配，否则游戏里显示为「不兼容」（红）
+        fmt = detect_pack_format(instance_of_pack(pack_dir), version)
+        mcmeta = build_pack_mcmeta(
+            f"§b{cn_name} 汉化包 {_DESC_SUFFIX}", fmt)
         _write_text(pack_dir / "pack.mcmeta",
                     json.dumps(mcmeta, ensure_ascii=False, indent=2))
 
@@ -192,7 +413,8 @@ def create_pack(root: Path, version: str, mod: dict,
             "----------------------------------------\n"
             "本汉化包由「MC 模组汉化工具」自动生成，\n"
             "同时提供 zh_cn.json 与 zh_cn.lang 两种语言文件，\n"
-            "兼容 Minecraft 1.0 ~ 最新快照。\n\n"
+            f"资源包格式号按 MC {version or '?'} 写入（{fmt[0]}.{fmt[1]}），\n"
+            "与目标版本匹配，游戏内不会显示为「不兼容」。\n\n"
             "如何在游戏内启用\n"
             "----------------------------------------\n"
             "1. 打开游戏，进入「选项 → 资源包」。\n"

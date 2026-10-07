@@ -46,9 +46,22 @@ EXCLUDES = (
 #: 运行期才读的文本资源（--onefile 不会自动带上，必须显式复制到 dist）
 TEXT_RESOURCES = ("lengzhishi.txt", "sponsors.txt", "wangzhi.txt")
 
+#: PyInstaller 的超时上限（秒）。正常约 60~90 秒；实测曾出现过**静默卡死**
+#: （50 分钟零产出、`.build/work-*/` 全空），所以必须有上限，不能无限等。
+BUILD_TIMEOUT = 900
+
 
 def log(msg: str) -> None:
     print(f"[build] {msg}", flush=True)
+
+
+def _tail(path: Path, n: int = 4000) -> str:
+    """读文件末尾 n 个字符（读不到就返回空串）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-n:]
 
 
 # ---------------------------------------------------------------- 版本
@@ -197,17 +210,33 @@ def build(onefile: bool, icon: Path | None) -> Path:
         args += ["--exclude-module", m]
     args.append(str(ENTRY))
 
-    log("开始 PyInstaller 打包（约需 1-3 分钟）…")
+    log_path = BUILD / "pyinstaller.log"
+    log(f"开始 PyInstaller 打包（约需 1-3 分钟，日志：{log_path}）…")
     env = dict(os.environ)
     env.setdefault("TMPDIR", str(ROOT / ".tmp"))
     env.setdefault("TEMP", str(ROOT / ".tmp"))
     env.setdefault("TMP", str(ROOT / ".tmp"))
-    proc = subprocess.run(args, cwd=str(ROOT), env=env,
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    # ⚠️ 把日志写进**文件**而不是管道：管道写满后子进程会阻塞，表现为「静默卡死」；
+    # 同时加超时，卡住时能快速失败并留下可查的日志（而不是干等几十分钟）。
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="replace") as logf:
+            proc = subprocess.run(args, cwd=str(ROOT), env=env,
+                                  stdout=logf, stderr=subprocess.STDOUT,
+                                  text=True, timeout=BUILD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(_tail(log_path), file=sys.stderr)
+        raise SystemExit(
+            f"PyInstaller 超过 {BUILD_TIMEOUT}s 仍未结束（疑似卡死）。\n"
+            f"完整日志：{log_path}\n"
+            f"可先清理后重试：python build.py --clean-only")
+    except OSError as exc:
+        raise SystemExit(f"无法启动 PyInstaller：{exc}")
+
     if proc.returncode != 0:
-        print(proc.stdout[-4000:])
-        print(proc.stderr[-4000:], file=sys.stderr)
-        raise SystemExit(f"PyInstaller 打包失败（退出码 {proc.returncode}）")
+        print(_tail(log_path))
+        raise SystemExit(f"PyInstaller 打包失败（退出码 {proc.returncode}），"
+                         f"完整日志：{log_path}")
 
     exe = DIST / f"{APP_NAME}.exe"
     if not exe.is_file():
