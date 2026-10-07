@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """设置界面。
 
-包含四块内容：翻译模型选择、个性化（付费门禁）、赞助、杂项（千万别点 + 回声洞）。
-整个页面放在 ``QScrollArea`` 里，窗口变小时可滚动。
+包含五块内容：翻译模型选择、翻译选项（强化翻译）、个性化（付费门禁）、赞助、
+杂项（千万别点 + 回声洞）。整个页面放在 ``QScrollArea`` 里，窗口变小时可滚动。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
-from PySide6.QtWidgets import (QColorDialog, QFileDialog, QFrame, QHBoxLayout,
-                               QLineEdit, QMessageBox, QPushButton, QScrollArea,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import QRectF, QSize, Qt, QUrl
+from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QFont, QFontMetrics,
+                           QPainter, QPainterPath, QPen)
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QFileDialog, QFrame,
+                               QHBoxLayout, QLineEdit, QMessageBox, QPushButton,
+                               QScrollArea, QVBoxLayout, QWidget)
 
-from .. import paths
+from .. import icons, paths
 from ..core import translator
 from ..state import APP_VERSION, DEFAULT_TRANSLATOR_TITLE, STATE
 from ..theme import C
@@ -48,6 +49,69 @@ class CaveBox(QFrame):
     def mouseDoubleClickEvent(self, e):
         self.text_label.setText(STATE.random_lengzhishi())
         super().mouseDoubleClickEvent(e)
+
+
+class CheckOption(QCheckBox):
+    """自绘复选框：蓝底 + 白色矢量对勾。
+
+    为什么不用原生 indicator：QSS 里 ``QCheckBox::indicator:checked`` 只能画出一块
+    纯蓝方块（QSS 的 ``image`` 需要图片文件，而本项目零图片资源），勾选态辨识度差。
+    这里直接复用 ``icons`` 的矢量对勾，与 ``ModCard`` / ``PackRow`` 的勾选视觉一致。
+    """
+
+    BOX = 18   # 方框边长
+    GAP = 8    # 方框与文字的间距
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFont(QFont("Microsoft YaHei UI", 12))
+        self.setMinimumHeight(28)
+        self._hover = False
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        fm = QFontMetrics(self.font())
+        return QSize(self.BOX + self.GAP + fm.horizontalAdvance(self.text()) + 6,
+                     max(28, self.BOX + 10))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        top = (self.height() - self.BOX) / 2
+        rect = QRectF(0.5, top + 0.5, self.BOX - 1, self.BOX - 1)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 5, 5)
+
+        if self.isChecked():
+            p.fillPath(path, QBrush(QColor(C.BLUE)))
+            p.setPen(QPen(QColor(C.BLUE), 1.4))
+            p.drawPath(path)
+            p.drawPixmap(int(rect.x()) + 2, int(rect.y()) + 2,
+                         icons.pixmap("check", "#FFFFFF", self.BOX - 4))
+        else:
+            p.fillPath(path, QBrush(QColor("#FFFFFF")))
+            p.setPen(QPen(QColor(C.BLUE_LIGHT if self._hover else C.BORDER), 1.4))
+            p.drawPath(path)
+
+        p.setPen(QPen(QColor(C.TEXT)))
+        p.setFont(self.font())
+        p.drawText(QRectF(self.BOX + self.GAP, 0,
+                          max(0, self.width() - self.BOX - self.GAP), self.height()),
+                   Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        p.end()
 
 
 class SettingsPage(QWidget):
@@ -101,7 +165,23 @@ class SettingsPage(QWidget):
         model_card.add(brow)
         root.addWidget(model_card)
 
-        # ---------------------------------------------------- 3) 个性化（付费门禁）
+        # ---------------------------------------------------- 3) 翻译选项
+        t_card = Card(title="翻译选项")
+        self.enhanced_check = CheckOption("强化翻译")
+        self.enhanced_check.setToolTip(
+            "勾选后，模型每翻译完一条都会检查译文是否通顺；\n"
+            f"判定不通顺则自动重新翻译，最多重试 {translator.ENHANCED_MAX_RETRIES} 次。\n"
+            "开启后会需要更长时间进行翻译。")
+        self.enhanced_check.toggled.connect(self._on_enhanced_toggled)
+        t_card.add(self.enhanced_check)
+        t_card.add(label(
+            "逐条检查译文的通顺性：判定不通顺就自动重译，直到满足要求或达到重试上限"
+            f"（最多 {translator.ENHANCED_MAX_RETRIES} 次）。默认关闭；"
+            "开启后会需要更长时间进行翻译。",
+            obj="Hint", wrap=True))
+        root.addWidget(t_card)
+
+        # ---------------------------------------------------- 4) 个性化（付费门禁）
         p_card = Card(title="个性化")
         self.border_btn = self._color_button(STATE.border_color)
         self.border_btn.clicked.connect(self._pick_border)
@@ -136,7 +216,7 @@ class SettingsPage(QWidget):
         p_card.add(save_row)
         root.addWidget(p_card)
 
-        # ---------------------------------------------------- 4) 赞助
+        # ---------------------------------------------------- 5) 赞助
         s_card = Card(title="赞助")
         sp_row = QHBoxLayout()
         sp_row.setSpacing(8)
@@ -157,7 +237,7 @@ class SettingsPage(QWidget):
         s_card.add(self.sponsor_label)
         root.addWidget(s_card)
 
-        # ---------------------------------------------------- 5) 杂项
+        # ---------------------------------------------------- 6) 杂项
         misc_card = Card(title="杂项")
         dnc_row = QHBoxLayout()
         dnc_row.setSpacing(8)
@@ -176,6 +256,7 @@ class SettingsPage(QWidget):
         # ---------------------------------------------------- 信号订阅
         STATE.modelChanged.connect(self._refresh_model)
         STATE.sponsorsChanged.connect(self._refresh_sponsors)
+        STATE.enhancedTranslateChanged.connect(self._refresh_enhanced)
 
         self.refresh()
 
@@ -206,10 +287,11 @@ class SettingsPage(QWidget):
     # ================================================================ 刷新
 
     def refresh(self) -> None:
-        """刷新模型 / 赞助 / 个性化三块。"""
+        """刷新模型 / 赞助 / 个性化 / 翻译选项四块。"""
         self._refresh_model()
         self._refresh_sponsors()
         self._refresh_personalize()
+        self._refresh_enhanced()
 
     def _refresh_model(self) -> None:
         has = STATE.has_model()
@@ -244,6 +326,22 @@ class SettingsPage(QWidget):
         for w in (self.border_btn, self.accent_btn, self.title_edit):
             w.setEnabled(unlocked)
         self.lock_box.setVisible(not unlocked)
+
+    def _refresh_enhanced(self) -> None:
+        """把 STATE 里的开关同步到复选框（外部改状态时也走这里）。"""
+        self.enhanced_check.setChecked(bool(STATE.enhanced_translate))
+
+    # ================================================================ 翻译选项动作
+
+    def _on_enhanced_toggled(self, on: bool) -> None:
+        """复选框被点击：写回 STATE（落盘 + 发信号）。
+
+        ``setChecked`` 也会触发本槽，因此值没变时直接返回，避免信号回环。
+        """
+        if bool(STATE.enhanced_translate) == bool(on):
+            return
+        STATE.set_enhanced_translate(bool(on))
+        toast(self, "已开启强化翻译" if on else "已关闭强化翻译")
 
     # ================================================================ 模型动作
 

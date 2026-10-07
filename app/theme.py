@@ -15,6 +15,11 @@ from string import Template
 class C:
     """全局配色。"""
 
+    # 品牌色（只给 logo 用）—— 2026-10-04 按用户要求由暖红改为冷调蓝。
+    # 与界面强调色 C.BLUE 解耦：apply_accent 刻意不碰它，
+    # 否则 config.json 里的 accent_color 会在启动时把 logo 顶成另一个颜色。
+    BRAND = "#1565C0"
+
     # 品牌蓝（可被用户个性化覆盖，见 apply_accent）
     BLUE = "#2E6DB4"
     BLUE_DARK = "#1B4A80"

@@ -43,7 +43,7 @@ class MainWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setWindowTitle(paths.APP_NAME)
-        self.setWindowIcon(icons.icon("logo", C.BLUE, 64))
+        self.setWindowIcon(icons.icon("logo", C.BRAND, 64))
         self.setMinimumSize(940, 640)
         self.resize(1180, 760)
 
@@ -109,8 +109,8 @@ class MainWindow(QWidget):
         brand.setContentsMargins(8, 0, 0, 0)
         brand.setSpacing(9)
         logo = QLabel()
-        logo.setPixmap(icons.pixmap("logo", C.BLUE, 30))
-        logo.setFixedSize(30, 30)
+        logo.setPixmap(icons.pixmap("logo", C.BRAND, 40))
+        logo.setFixedSize(40, 40)
         brand.addWidget(logo)
 
         col = QVBoxLayout()

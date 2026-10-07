@@ -576,7 +576,7 @@ def toast(parent: QWidget, text: str, msec: int = 2200) -> Toast:
 class TitleBar(QWidget):
     """无边框窗口标题栏：左侧图标+标题，右侧最小化/最大化/关闭。"""
 
-    def __init__(self, title: str, parent=None, brand_icon: str = "logo"):
+    def __init__(self, title: str, parent=None, brand_icon: str = "logo_mono"):
         super().__init__(parent)
         self.setFixedHeight(38)
         self._title = title
@@ -624,12 +624,13 @@ class TitleBar(QWidget):
         g.setColorAt(1.0, QColor(C.TITLE_BOTTOM))
         p.fillRect(self.rect(), QBrush(g))
 
-        p.drawPixmap(12, int((self.height() - 22) / 2), icons.pixmap(self._brand, "#FFFFFF", 22))
+        # 26px 是「八边形斜角还看得出来」的下限；再小就糊成白色圆球了
+        p.drawPixmap(12, int((self.height() - 26) / 2), icons.pixmap(self._brand, "#FFFFFF", 26))
         p.setPen(QPen(QColor("#FFFFFF")))
         f = QFont("Microsoft YaHei UI", 11)
         f.setBold(True)
         p.setFont(f)
-        p.drawText(QRectF(42, 0, self.width() - 200, self.height()),
+        p.drawText(QRectF(46, 0, self.width() - 200, self.height()),
                    Qt.AlignVCenter | Qt.AlignLeft, self._title)
         p.end()
 

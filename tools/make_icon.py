@@ -27,7 +27,7 @@ SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 def _png_bytes(size: int) -> bytes:
     """把矢量图标渲染成指定尺寸的 PNG 字节流。"""
-    pm = icons.pixmap("logo", C.BLUE, size)
+    pm = icons.pixmap("logo", C.BRAND, size)
     ba = QByteArray()
     buf = QBuffer(ba)
     buf.open(QBuffer.WriteOnly)

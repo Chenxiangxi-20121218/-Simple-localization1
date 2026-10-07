@@ -33,6 +33,7 @@ __all__ = [
     "get_model",
     "estimate_seconds",
     "BUILTIN_TERMS",
+    "ENHANCED_MAX_RETRIES",
 ]
 
 
@@ -293,6 +294,30 @@ _CJK_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
 
 #: 构建术语替换正则时最多使用的词条数（防止超大词典把正则撑爆）
 _MAX_PATTERN_TERMS = 60000
+
+# ====================================================================== 强化翻译
+#
+# 「强化翻译」（默认关闭，见 STATE.enhanced_translate）：
+#   翻译 → 通顺性检查 → 判定不通顺则换一种策略重译 → 直到通顺或达到重试上限。
+# 全部策略都不通顺时返回得分最高的一条，绝不返回空串、绝不无限循环。
+
+#: 判定不通顺时最多重译几次（不含首次翻译）。默认策略之外另有 2 种加强策略。
+ENHANCED_MAX_RETRIES = 3
+
+#: 通顺性得分阈值：>= 该值即视为通顺（不再重译）。
+_FLUENCY_THRESHOLD = 0.75
+
+#: 连续英文单词数达到该值即视为「成片未翻译」，明显扣分。
+_FLUENCY_ENGLISH_RUN = 3
+
+#: 逐段翻译策略的分切正则（捕获组会保留分隔符本身）。
+_SEGMENT_SPLIT_RE = re.compile(r"([^A-Za-z]+)")
+
+#: 统计连续英文单词用（把「Comparator Signal Strength」算作 3 个）。
+_WORD_RUN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*)*")
+
+#: 词形还原时尝试剥离的后缀（长后缀优先，避免 "es" 先把 "ies" 吃掉）。
+_STEM_SUFFIXES = ("ies", "est", "ing", "ed", "ly", "es", "er", "s")
 
 # ====================================================================== zip 解析
 
@@ -621,6 +646,154 @@ class TranslateModel:
     def translate_batch(self, texts: list[str]) -> list[str]:
         """批量翻译，逐条调用 :meth:`translate`。"""
         return [self.translate(t) for t in texts]
+
+    # ------------------------------------------------------------ 通顺性检查
+
+    @staticmethod
+    def _max_english_run(text: str) -> int:
+        """返回最长的「连续英文单词」个数（按空白分隔）。"""
+        best = 0
+        for chunk in _WORD_RUN_RE.findall(text):
+            best = max(best, len(chunk.split()))
+        return best
+
+    def fluency_score(self, text: str, source: str = "") -> float:
+        """给译文打一个 0~1 的通顺性得分（越高越通顺）。
+
+        这是「强化翻译」的判定依据：得分 >= :data:`_FLUENCY_THRESHOLD` 即视为通顺。
+        纯启发式、零依赖、确定性——只拦截「明显不通顺」，不做语义级评价
+        （语义质量取决于具体模型，模型可插拔）。
+        """
+        if not text:
+            return 0.0
+        text = str(text)
+        score = 1.0
+
+        # 1) 哨兵残留：占位符还原失败，属于致命问题
+        if "\x00" in text:
+            score -= 0.6
+
+        # 2) 中文之间残留空格（「石头 剑」）
+        if _CJK_SPACE_RE.search(text):
+            score -= 0.15
+
+        # 3) 大段连续英文 = 成片未翻译
+        run = self._max_english_run(text)
+        if run >= _FLUENCY_ENGLISH_RUN:
+            score -= 0.2 * (run - _FLUENCY_ENGLISH_RUN + 1)
+
+        # 4) 三个及以上相同汉字连排（「的的的」）
+        if re.search(r"([\u4e00-\u9fff])\1{2,}", text):
+            score -= 0.15
+
+        # 5) 中文标点重复
+        if re.search(r"[，。、；：？！]{2,}", text):
+            score -= 0.1
+
+        # 6) 首尾多余空白
+        if text != text.strip():
+            score -= 0.05
+
+        # 7) 占位符数量与原文不一致（还原顺序/数量错乱）
+        if source and len(_PLACEHOLDER_RE.findall(str(source))) != \
+                len(_PLACEHOLDER_RE.findall(text)):
+            score -= 0.5
+
+        return max(0.0, min(1.0, score))
+
+    def is_fluent(self, text: str, source: str = "") -> bool:
+        """译文是否通顺（强化翻译的判定入口）。"""
+        return self.fluency_score(text, source) >= _FLUENCY_THRESHOLD
+
+    # ------------------------------------------------------------ 重译策略
+
+    def _translate_word(self, word: str) -> str:
+        """单个英文片段：精确 → 大小写不敏感 → 术语替换 → 原样保留。"""
+        if word in self._exact:
+            return self._exact[word]
+        low = word.lower()
+        if low in self._lower:
+            return self._lower[low]
+        return self._replace_terms(word)
+
+    def _translate_word_stem(self, word: str) -> str:
+        """在 :meth:`_translate_word` 基础上做轻量词形还原（去复数 / 常见后缀）。"""
+        hit = self._translate_word(word)
+        if hit != word:
+            return hit
+        low = word.lower()
+        for suf in _STEM_SUFFIXES:
+            if low.endswith(suf) and len(low) > len(suf) + 1:
+                stem = low[: -len(suf)]
+                if suf == "ies":
+                    stem += "y"
+                if stem in self._lower:
+                    return self._lower[stem]
+        return hit
+
+    def _translate_segmented(self, text: str, aggressive: bool = False) -> str:
+        """按非字母分隔符切分，逐段翻译后原样拼接（保留空格与标点）。
+
+        ``aggressive=True`` 时额外尝试词形还原后查词，用于处理标准策略没命中的变形词。
+        """
+        out: list[str] = []
+        for part in _SEGMENT_SPLIT_RE.split(text):
+            if not part:
+                continue
+            if part[0].isalpha():
+                out.append(self._translate_word_stem(part) if aggressive
+                           else self._translate_word(part))
+            else:
+                out.append(part)
+        return _CJK_SPACE_RE.sub("", "".join(out))
+
+    def _translate_attempt(self, text: str, attempt: int) -> str:
+        """第 ``attempt`` 次尝试（0 = 默认策略，之后逐级加强）。"""
+        if attempt <= 0:
+            cached = self._cache.get(text)
+            if cached is not None:
+                return cached
+            result = self._translate_uncached(text)
+            self._cache[text] = result
+            return result
+        if attempt == 1:
+            return self._translate_segmented(text)
+        return self._translate_segmented(text, aggressive=True)
+
+    def translate_enhanced_ex(self, text: str | None,
+                              max_retries: int | None = None) -> tuple[str, int, bool]:
+        """强化翻译：翻译 → 通顺性检查 → 不通顺则换策略重译。
+
+        返回 ``(译文, 实际尝试次数, 是否最终判定通顺)``。
+        最多尝试 ``1 + max_retries`` 次（默认 :data:`ENHANCED_MAX_RETRIES`）；
+        全部策略都不通顺时返回其中**得分最高**的一条，绝不返回空串。
+        """
+        if not text:
+            return "", 0, True
+        text = str(text)
+        try:
+            limit = ENHANCED_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+        except (TypeError, ValueError):
+            limit = ENHANCED_MAX_RETRIES
+
+        best = ""
+        best_score = -1.0
+        attempts = 0
+        for attempt in range(limit + 1):
+            candidate = self._translate_attempt(text, attempt)
+            attempts += 1
+            score = self.fluency_score(candidate, text)
+            if score > best_score:
+                best_score = score
+                best = candidate
+            if score >= _FLUENCY_THRESHOLD:
+                return candidate, attempts, True
+        return best, attempts, False
+
+    def translate_enhanced(self, text: str | None,
+                           max_retries: int | None = None) -> str:
+        """强化翻译的简洁入口，只返回译文。"""
+        return self.translate_enhanced_ex(text, max_retries)[0]
 
     # ------------------------------------------------------------ 其他
 

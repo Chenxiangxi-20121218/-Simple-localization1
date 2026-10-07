@@ -6,9 +6,13 @@
 """
 from __future__ import annotations
 
+import math
+import os
+
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QPainter, QPainterPath,
-                           QPen, QPixmap, QPolygonF)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QFontMetricsF,
+                           QIcon, QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF, QRadialGradient)
 
 _LOGICAL = 64.0
 
@@ -205,15 +209,332 @@ def _ic_brush(p: QPainter, c: str) -> None:
     p.drawEllipse(QPointF(42, 38), 3.6, 3.6)
 
 
+def _mix(a: QColor, b: QColor, t: float) -> QColor:
+    """在两个颜色之间线性插值（t=0 取 a，t=1 取 b）。"""
+    return QColor(
+        round(a.red() + (b.red() - a.red()) * t),
+        round(a.green() + (b.green() - a.green()) * t),
+        round(a.blue() + (b.blue() - a.blue()) * t),
+    )
+
+
+#: 品牌色兜底值（与 ``theme.C.BRAND`` 保持一致）。传入色非法时用它
+_LOGO_FALLBACK = "#1565C0"
+#: 小于该像素尺寸时不再画文字 —— 三个字符会糊成一团，只留剪影更干净
+_LOGO_TEXT_MIN_PX = 40
+
+#: 主 logo（八边形）：外接圆半径 / 圆角 / 垂直中心
+_OCTA_R = 26.0
+#: 圆角不能给太大 —— 超过斜切边长的一半就把 45° 角磨圆了，整体会读成
+#: 「圆角正方形」而不是八边形。4.0 是「够软且角仍在」的临界值
+_OCTA_CORNER = 4.0
+_OCTA_CY = 32.5
+
+#: 对比版 logo（七边形）：半径按外接盒与八边形对齐，cy 让边界盒垂直居中
+_HEPTA_R = 25.0
+_HEPTA_CORNER = 4.0
+_HEPTA_CY = 33.2
+
+
+def _polygon_points(cx: float, cy: float, r: float, n: int,
+                    start_deg: float = -90.0) -> QPolygonF:
+    """正 n 边形顶点表。``start_deg`` 是 ``at(0)`` 的极角（度，顺时针为正）。"""
+    pts = []
+    for i in range(n):
+        a = math.radians(start_deg + i * 360.0 / n)
+        pts.append(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+    return QPolygonF(pts)
+
+
+def _octagon_points(cx: float, cy: float, r: float) -> QPolygonF:
+    """切角正方形（flat-top）正八边形 —— 仿 PCL2 启动器图标。
+
+    上下左右是四条平边，四个角做 45° 斜切。``at(0)`` 起于左上顶点、顺时针排：
+    ``0/1`` 顶边两端、``2/3`` 右边两端、``4/5`` 底边两端、``6/7`` 左边两端。
+    """
+    return _polygon_points(cx, cy, r, 8, -112.5)
+
+
+def _heptagon_points(cx: float, cy: float, r: float) -> QPolygonF:
+    """顶点朝上的正七边形（对比版）。``at(0)`` 是正上方的尖顶。"""
+    return _polygon_points(cx, cy, r, 7, -90.0)
+
+
+def _rounded_path(pts: QPolygonF, radius: float, closed: bool = True) -> QPainterPath:
+    """给多边形 / 折线倒圆角，返回真实轮廓路径。
+
+    比「粗描边 + RoundJoin」那种取巧写法更好用：描边法拿不到轮廓，
+    而这里的路径可以直接 ``setClipPath``，才能做「高光只出现在图形内部」这种效果。
+    """
+    n = pts.count()
+    path = QPainterPath()
+
+    def corner(v: QPointF, pv: QPointF, nv: QPointF, move: bool) -> None:
+        vp = (pv.x() - v.x(), pv.y() - v.y())
+        vn = (nv.x() - v.x(), nv.y() - v.y())
+        lp = math.hypot(*vp) or 1.0
+        ln = math.hypot(*vn) or 1.0
+        rr = min(radius, lp * 0.5, ln * 0.5)
+        a = QPointF(v.x() + vp[0] / lp * rr, v.y() + vp[1] / lp * rr)
+        b = QPointF(v.x() + vn[0] / ln * rr, v.y() + vn[1] / ln * rr)
+        path.moveTo(a) if move else path.lineTo(a)
+        path.quadTo(v, b)
+
+    if closed:
+        for i in range(n):
+            corner(pts.at(i), pts.at((i - 1) % n), pts.at((i + 1) % n), i == 0)
+        path.closeSubpath()
+    else:
+        path.moveTo(pts.at(0))
+        for i in range(1, n - 1):
+            corner(pts.at(i), pts.at(i - 1), pts.at(i + 1), False)
+        path.lineTo(pts.at(n - 1))
+    return path
+
+
+#: 图标文字用的「微软标准英文字体」（Segoe UI）。按优先级尝试手动加载字体文件 ——
+#: 离屏 / 无桌面环境里 ``QFontDatabase.families()`` 实测为 0（返回 0 个家族），
+#: 此时直接 ``drawText`` 会静默渲染成「豆腐块」方框并写进交付文件（不报错、不崩溃）；
+#: 只有显式 ``addApplicationFont`` 加载 ttf，才能拿到真正可用的家族名。
+_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/segoeuib.ttf",   # Segoe UI Bold
+    "C:/Windows/Fonts/seguisb.ttf",    # Segoe UI Semibold
+    "C:/Windows/Fonts/segoeui.ttf",    # Segoe UI Regular
+    "C:/Windows/Fonts/arialbd.ttf",    # 最后的兜底
+)
+_latin_family: str | None = None
+
+
+def _latin_font_family() -> str:
+    """返回可用的拉丁字体家族名（首次调用时加载并缓存）；全失败则返回空串。"""
+    global _latin_family
+    if _latin_family is None:
+        _latin_family = ""
+        for path in _FONT_CANDIDATES:
+            if not os.path.isfile(path):
+                continue
+            fid = QFontDatabase.addApplicationFont(path)
+            if fid == -1:
+                continue
+            fams = QFontDatabase.applicationFontFamilies(fid)
+            if fams:
+                _latin_family = fams[0]
+                break
+    return _latin_family
+
+
+def _draw_sl1(p: QPainter, color: str = "#FFFFFF",
+              offset: tuple[float, float] = (0.0, 0.0),
+              alpha: int = 255, scale: float = 1.0) -> None:
+    """用微软标准英文字体（Segoe UI）绘制「SL1」。
+
+    字体经 ``_latin_font_family`` 显式加载；万一一个都加载不到，就回退到
+    ``_draw_sl1_vector`` 的矢量描边 —— 宁可字形与预期有出入，也绝不能把
+    「豆腐块」方框写进交付的图标里。
+    """
+    family = _latin_font_family()
+    if not family:
+        _draw_sl1_vector(p, color, offset, alpha, scale)
+        return
+
+    col = QColor(color)
+    col.setAlpha(alpha)
+
+    dev = p.device()
+    px = dev.width() if dev is not None else 64
+
+    f = QFont(family)
+    # 20px 时「SL1」实测宽 33 / 大写高 14 个逻辑单位，与原矢量字
+    # （宽 32.5 / 高 15）的占位基本一致 —— 再大就会把八边形的留白吃光
+    f.setPixelSize(20)
+    f.setBold(True)
+    if px < 64:
+        # 小尺寸下笔画会被抗锯齿吃掉，用更重的字重顶住（与矢量版的反向加粗同理）
+        f.setWeight(QFont.Weight.ExtraBold)
+    fm = QFontMetricsF(f)
+
+    text = "SL1"
+    w = fm.horizontalAdvance(text)
+    cap = fm.capHeight()
+
+    dx, dy = offset
+    p.save()
+    p.translate(dx, dy)
+    if scale != 1.0:
+        # 以文字中心为基准缩放，留出更舒展的四周留白（现代图标讲究留白）
+        p.translate(32.0, 32.5)
+        p.scale(scale, scale)
+        p.translate(-32.0, -32.5)
+    p.setFont(f)
+    p.setPen(QPen(col))
+    p.setBrush(Qt.NoBrush)
+    # 按「大写字母高度」垂直居中：baseline = 中心 + capHeight / 2
+    p.drawText(QPointF(32.0 - w / 2.0, 32.5 + cap / 2.0), text)
+    p.restore()
+
+
+def _draw_sl1_vector(p: QPainter, color: str = "#FFFFFF",
+                     offset: tuple[float, float] = (0.0, 0.0),
+                     alpha: int = 255, scale: float = 1.0) -> None:
+    """矢量描边版「SL1」—— 字体加载失败时的兜底，零字体依赖。
+
+    字形用直线 + 三次贝塞尔手工拼，任何机器上都是同一个样子，
+    代价是不如真字体标准。
+    """
+    y_top, y_bot = 25.0, 40.0          # 垂直居中于八边形中心（cy = 32.5）
+    y_mid = (y_top + y_bot) / 2.0
+
+    col = QColor(color)
+    col.setAlpha(alpha)
+    # 小尺寸下三个字符的笔画间隙会被抗锯齿填满、糊成一团：
+    # 按 64px 基准反向加粗，把「S / L / 1」的形状保住（上限 1.9 倍，再粗就糊实了）
+    dev = p.device()
+    px = dev.width() if dev is not None else 64
+    lw = 2.4 * max(1.0, min(1.9, 64.0 / max(px, 20)))
+    pen = QPen(col, lw)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    dx, dy = offset
+    p.save()
+    p.translate(dx, dy)
+    if scale != 1.0:
+        # 以文字中心为基准缩放，留出更舒展的四周留白（现代图标讲究留白）
+        p.translate(32.0, 32.5)
+        p.scale(scale, scale)
+        p.translate(-32.0, -32.5)
+
+    # S：上弧 → 左上竖 → 中段 S 弯 → 右下竖 → 下弧
+    # 拐角要带弧度，纯直角会读成「5」
+    r = 3.2
+    path = QPainterPath()
+    path.moveTo(24.5, y_top + r)
+    path.cubicTo(24.5, y_top, 15.5, y_top, 15.5, y_top + r)
+    path.lineTo(15.5, y_mid - r)
+    path.cubicTo(15.5, y_mid, 24.5, y_mid, 24.5, y_mid + r)
+    path.lineTo(24.5, y_bot - r)
+    path.cubicTo(24.5, y_bot, 15.5, y_bot, 15.5, y_bot - r)
+    p.drawPath(path)
+
+    # L：左竖 + 下横
+    path = QPainterPath()
+    path.moveTo(28.5, y_top)
+    path.lineTo(28.5, y_bot)
+    path.lineTo(37.5, y_bot)
+    p.drawPath(path)
+
+    # 1：左上斜旗 + 竖 + 底座
+    path = QPainterPath()
+    path.moveTo(41.5, y_top + 4.0)
+    path.lineTo(45.0, y_top)
+    path.lineTo(45.0, y_bot)
+    path.moveTo(41.5, y_bot)
+    path.lineTo(48.0, y_bot)
+    p.drawPath(path)
+
+    p.restore()
+
+
+def _logo_core(p: QPainter, c: str, pts_func, r: float, corner: float,
+               cy: float) -> None:
+    """logo 的公共绘制：主渐变 → 内部光影 → 「SL1」文字。
+
+    ``pts_func`` 决定轮廓（八边形 / 七边形共用同一套上色与文字逻辑），
+    两个版本除形状外完全一致，对比时才不会被光影差异干扰。
+
+    刻意**不做外投影**：烘死在 ico 里的阴影在浅色桌面上会糊成一圈灰边，
+    而且 Windows 自己会给图标加阴影，重复叠加只会显旧。
+    """
+    base = QColor(c)
+    if not base.isValid():
+        base = QColor(_LOGO_FALLBACK)
+
+    cx = 32.0
+    outer = pts_func(cx, cy, r)
+    n = outer.count()
+    shape = _rounded_path(outer, corner)
+
+    dev = p.device()
+    px = dev.width() if dev is not None else 64
+
+    # 1) 主渐变：左上亮青蓝 → 品牌色 → 右下深色。
+    #    高光色必须与品牌色同调 —— 冷色底混暖色（原先写死的橘红 #FF8A6B）
+    #    是互补色相混，会直接糊成灰紫色。
+    grad = QLinearGradient(13.0, 7.0, 51.0, 58.0)
+    grad.setColorAt(0.00, _mix(base, QColor("#6FD8FF"), 0.50))
+    grad.setColorAt(0.46, base)
+    grad.setColorAt(1.00, _mix(base, QColor("#000000"), 0.42))
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(grad))
+    p.drawPath(shape)
+
+    # 2) 内部光影：左上柔光 + 底部压深 + 顶部贴边细亮线。
+    #    全部裁剪在轮廓内 —— 描边有一半宽度在路径外侧，不裁剪会溢出。
+    p.save()
+    p.setClipPath(shape)
+
+    glow = QRadialGradient(QPointF(21.0, 12.0), 38.0)
+    glow.setColorAt(0.0, QColor(255, 255, 255, 52))
+    glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setBrush(QBrush(glow))
+    p.drawPath(shape)
+
+    deep = _mix(base, QColor("#000000"), 0.55)
+    deep.setAlpha(78)
+    shade = QLinearGradient(0.0, 32.0, 0.0, 58.0)
+    shade.setColorAt(0.0, QColor(0, 0, 0, 0))
+    shade.setColorAt(1.0, deep)
+    p.setBrush(QBrush(shade))
+    p.drawPath(shape)
+
+    # 只画顶部三段（前一条边 / 顶边 / 后一条边），不画整圈 ——
+    # 整圈会变成「描边感」，一眼就是旧风格
+    inner = pts_func(cx, cy, r - 1.3)
+    top = _rounded_path(QPolygonF([inner.at(n - 1), inner.at(0), inner.at(1)]),
+                        max(corner - 1.0, 1.0), closed=False)
+    top_pen = QPen(QColor(255, 255, 255, 92), 1.5)
+    top_pen.setCapStyle(Qt.RoundCap)
+    top_pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(top_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(top)
+    p.restore()
+
+    # 3) 文字：小尺寸下省略，避免糊成一团
+    if px < _LOGO_TEXT_MIN_PX:
+        return
+    # 文字投影同样由品牌色推导 —— 原先写死暗红 #5A0A10，换冷色底后同样会发脏
+    _draw_sl1(p, _mix(base, QColor("#000000"), 0.72).name(), (0.0, 0.8), 45, 1.0)
+    _draw_sl1(p)
+
+
 def _ic_logo(p: QPainter, c: str) -> None:
-    """品牌标识：草方块。"""
+    """品牌标识：圆角八边形 + 「SL1」字样（冷调蓝）。
+
+    形状仿 PCL2 启动器图标 —— 切角正方形，四条平边 + 四个 45° 斜角。
+    颜色由传入的 ``c`` 推导（亮 → 本色 → 深色三段），
+    但调用方传的是固定的 ``C.BRAND``，所以它**不随界面强调色变化**。
+    """
+    _logo_core(p, c, _octagon_points, _OCTA_R, _OCTA_CORNER, _OCTA_CY)
+
+
+def _ic_logo_heptagon(p: QPainter, c: str) -> None:
+    """对比版：圆角七边形 + 「SL1」字样，除轮廓外与 ``_ic_logo`` 完全一致。"""
+    _logo_core(p, c, _heptagon_points, _HEPTA_R, _HEPTA_CORNER, _HEPTA_CY)
+
+
+def _ic_logo_mono(p: QPainter, c: str) -> None:
+    """单色剪影版 logo（标题栏用）。
+
+    标题栏是「小尺寸 + 深色底」的场景：渐变和内部光影在这个尺度下只会糊成
+    一个白球，反而看不出八边形。这里只保留轮廓本身，剪影更清楚。
+    """
+    shape = _rounded_path(_octagon_points(32.0, 32.5, _OCTA_R), _OCTA_CORNER)
     p.setPen(Qt.NoPen)
     p.setBrush(QBrush(QColor(c)))
-    p.drawRoundedRect(QRectF(9, 9, 46, 46), 8, 8)
-    p.setBrush(QBrush(QColor("#FFFFFF")))
-    p.drawRect(QRectF(20, 26, 10, 10))
-    p.drawRect(QRectF(34, 26, 10, 10))
-    p.drawRect(QRectF(20, 40, 24, 5))
+    p.drawPath(shape)
 
 
 def _ic_clock(p: QPainter, c: str) -> None:
@@ -270,6 +591,8 @@ _DRAWERS = {
     "list": _ic_list,
     "brush": _ic_brush,
     "logo": _ic_logo,
+    "logo_mono": _ic_logo_mono,
+    "logo_heptagon": _ic_logo_heptagon,
     "clock": _ic_clock,
     "lock": _ic_lock,
     "star": _ic_star,

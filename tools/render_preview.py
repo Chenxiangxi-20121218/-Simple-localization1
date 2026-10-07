@@ -209,7 +209,12 @@ def main() -> int:
     win.resize(1180, 1020)
     win.router.go("settings"); shot("10_settings_personalize.png")
 
+    # ================= 8. 强化翻译勾选态 =================
+    STATE.set_enhanced_translate(True)
+    win.router.go("settings"); shot("11_settings_enhanced.png")
+
     # ================= 收尾 =================
+    STATE.set_enhanced_translate(False)
     STATE.personalize_unlocked = False
     STATE.save()
     if CONFIG_BAK.is_file():

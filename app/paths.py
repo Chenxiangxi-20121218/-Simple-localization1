@@ -132,15 +132,15 @@ def versions_dir(game_dir: Path) -> Path:
 
 
 def list_versions(game_dir: Path) -> list[str]:
-    """列出当前游戏目录下可用的版本名。"""
+    """列出当前游戏目录下可用的版本名（只认目录，排除汉化包与压缩包）。"""
     out: list[str] = []
     for base in (Path(game_dir) / ".versions", Path(game_dir) / "versions"):
         if not base.is_dir():
             continue
         for child in sorted(base.iterdir(), key=lambda x: x.name.lower()):
             if not child.is_dir():
-                continue
-            if child.name in ("汉化包",):
+                continue      # 排除 *.zip 等「同名压缩包」脏条目
+            if child.name == "汉化包":
                 continue
             # 版本目录里通常有 <name>.jar 或 <name>.json
             has_meta = any(child.glob("*.json")) or any(child.glob("*.jar"))
@@ -157,7 +157,15 @@ def list_versions(game_dir: Path) -> list[str]:
 
 
 def mods_dirs(game_dir: Path, version: str | None = None) -> list[Path]:
-    """返回需要扫描的模组目录列表（版本隔离 + 全局）。"""
+    """返回需要扫描的模组目录列表。
+
+    严格按版本隔离：只扫 ``<版本>/mods``，**不再回落游戏根目录的全局 ``mods/``**。
+
+    原因：根目录 ``mods/`` 里的 jar 是给「非版本隔离」启动方式用的，往往属于
+    另一个整合包 / 另一个 MC 版本。若一并扫描，选中一个没有装模组的版本也会
+    把其它版本的模组列出来并翻译（跨版本污染）。版本启动器（PCL2 等）开启版本
+    隔离后，实际生效的模组只来自 ``<版本>/mods``。
+    """
     gd = Path(game_dir)
     dirs: list[Path] = []
     if version:
@@ -165,9 +173,11 @@ def mods_dirs(game_dir: Path, version: str | None = None) -> list[Path]:
             d = base / version / "mods"
             if d.is_dir():
                 dirs.append(d)
-    d = gd / "mods"
-    if d.is_dir():
-        dirs.append(d)
+    else:
+        # 未选版本时才回落到全局 mods/，保证「没选版本」也有东西可扫
+        d = gd / "mods"
+        if d.is_dir():
+            dirs.append(d)
     return dirs
 
 

@@ -2,7 +2,8 @@
 """真实窗口下的交互冒烟测试（不依赖离屏截图，纯断言）。
 
 覆盖：按钮启用态、汉化包目录创建、资源包启用/禁用与 options.txt、
-模组扫描、离线翻译占位符保护、配置持久化、冷知识与赞助者文本。
+模组扫描、离线翻译占位符保护、强化翻译（通顺性检查 + 有界重译）、
+配置持久化、冷知识与赞助者文本。
 
 用法::
 
@@ -113,6 +114,9 @@ def main() -> int:
     from app.state import STATE
     from app.theme import qss
     from main import MainWindow
+
+    #: 在任何 save() 之前记录「强化翻译」的出厂默认值（config.json 里应无该字段）
+    enhanced_default = STATE.enhanced_translate
 
     app.setStyleSheet(qss())
     game = make_game_dir()
@@ -258,6 +262,72 @@ def main() -> int:
     data = json.loads(CONFIG.read_text(encoding="utf-8"))
     check(data["welcome_text"] == "自定义欢迎语", "welcome_text 已写入 config.json")
     check(data["model_name"] == "冒烟测试模型", "model_name 已写入 config.json")
+
+    # ---------- 10. 强化翻译 ----------
+    print("\n[10] 强化翻译")
+    check(enhanced_default is False, "出厂默认不勾选（STATE.enhanced_translate 为 False）")
+    check(isinstance(translator.ENHANCED_MAX_RETRIES, int)
+          and translator.ENHANCED_MAX_RETRIES >= 1,
+          f"重试上限为合理正整数：{translator.ENHANCED_MAX_RETRIES}")
+
+    # --- 通顺性判定 ---
+    check(model.is_fluent("石头方块"), "干净的中文译文 -> 判定通顺")
+    check(not model.is_fluent("红石 Comparator Signal Strength Emitter"),
+          "大段连续未翻译英文 -> 判定不通顺")
+    check(not model.is_fluent("坏\x00文"), "哨兵残留 -> 判定不通顺")
+    check(model.fluency_score("石头  剑") < model.fluency_score("石头剑"),
+          "中文之间残留空格会降低通顺性得分")
+    check(model.fluency_score("石头方块") > model.fluency_score("a b c d e"),
+          "通顺译文得分高于不通顺译文")
+
+    # --- 重译：有界、绝不返回空 ---
+    out1, tries1, fluent1 = model.translate_enhanced_ex("Pickaxe")
+    check(out1 == "镐子" and fluent1 and tries1 == 1,
+          f"通顺译文一次即通过（attempts={tries1}）")
+    out2, tries2, _ = model.translate_enhanced_ex(
+        "Zzqx Alpha Beta Gamma Delta Emitter", max_retries=2)
+    check(tries2 <= 3, f"重译次数不超过上限 1+2=3（attempts={tries2}）")
+    check(out2 != "", "始终不通顺时仍返回非空结果（取最高分候选）")
+    check(model.translate_enhanced("") == "", "强化翻译空串 -> 空串")
+    check(model.translate_enhanced(None) == "", "强化翻译 None -> 空串")
+    tp = model.translate_enhanced("Welcome %s to %1$d places")
+    check("%s" in tp and "%1$d" in tp, f"强化翻译路径仍保护占位符：{tp}")
+
+    # --- 状态读写 + 持久化 + 重新加载 ---
+    STATE.set_enhanced_translate(True)
+    check(STATE.enhanced_translate is True, "set_enhanced_translate(True) 生效")
+    STATE.save()
+    check(json.loads(CONFIG.read_text(encoding="utf-8")).get("enhanced_translate") is True,
+          "enhanced_translate=True 已写入 config.json")
+    from app.state import State as _State
+    check(_State().enhanced_translate is True, "新建 State 能从 config.json 读回 True")
+    STATE.load()
+    check(STATE.enhanced_translate is True, "STATE.load() 能读回 True")
+
+    # --- 设置界面复选框与 STATE 双向绑定 ---
+    settings = win.pages["settings"]
+    check(hasattr(settings, "enhanced_check"), "设置页存在强化翻译复选框")
+    win.router.go("settings")
+    app.processEvents()
+    check(settings.enhanced_check.isChecked() is True, "刷新后复选框反映 STATE（已勾选）")
+    settings.enhanced_check.setChecked(False)          # 模拟用户取消勾选
+    app.processEvents()
+    check(STATE.enhanced_translate is False, "取消勾选后写回 STATE")
+    check(json.loads(CONFIG.read_text(encoding="utf-8")).get("enhanced_translate") is False,
+          "取消勾选已持久化")
+
+    # --- 翻译线程中实际生效 ---
+    from app.core.worker import TranslateWorker
+    STATE.set_enhanced_translate(True)
+    logs: list[str] = []
+    failed_logs: list[str] = []
+    worker = TranslateWorker(str(game), "1.20.1", [mods[0]])
+    worker.log.connect(logs.append)
+    worker.failed.connect(failed_logs.append)
+    worker.run()                                       # 同步执行，不启线程
+    check(not failed_logs, f"开启强化翻译后 worker 正常完成：{failed_logs}")
+    check(any("强化翻译" in t for t in logs),
+          f"worker 在强化翻译开启时输出提示日志：{[t for t in logs if '强化翻译' in t]}")
 
     # ---------- 收尾（先出结论，再做清理，避免清理失败吞掉结果） ----------
     print("\n" + "=" * 56)

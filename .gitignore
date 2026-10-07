@@ -33,6 +33,9 @@ dist/
 .tmp/
 config.json
 
+# ---- 分支构建产物（按分支名归档的版本包，含大体积 exe，不入库）----
+git2026/
+
 # ---- 测试 / 预览生成物 ----
 preview/
 .pytest_cache/

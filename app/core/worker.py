@@ -79,6 +79,15 @@ class TranslateWorker(QThread):
                 self.failed.emit("未选择翻译模型，请从设置选择")
                 return
 
+            # --- 1.5) 强化翻译开关：开始时快照一次，运行中改设置不影响本次任务 ---
+            enhanced = bool(getattr(STATE, "enhanced_translate", False))
+            if enhanced:
+                self.log.emit(
+                    "已启用强化翻译：译文不通顺时最多重译 "
+                    f"{translator.ENHANCED_MAX_RETRIES} 次")
+            enh_retried = 0      # 触发过重译的条目数
+            enh_unresolved = 0   # 重译到上限仍不通顺的条目数
+
             # --- 2) 一次性读出所有模组的英文原文，避免重复解压 ---
             self.progress.emit(0, "正在读取模组文本…")
             collected: list[tuple[dict, dict[str, dict[str, str]]]] = []
@@ -117,7 +126,15 @@ class TranslateWorker(QThread):
                             if self._cancelled.is_set():
                                 self.log.emit("已取消")
                                 return
-                            out[key] = model.translate(en)
+                            if enhanced:
+                                # 翻译 → 通顺性检查 → 不通顺则自动重译（有上限）
+                                out[key], attempts, fluent = model.translate_enhanced_ex(en)
+                                if attempts > 1:
+                                    enh_retried += 1
+                                if not fluent:
+                                    enh_unresolved += 1
+                            else:
+                                out[key] = model.translate(en)
                             done_count += 1
                             # 每 20 条刷新一次进度（冷知识计时在 _emit_progress 内统一检查）
                             if done_count % self.PROGRESS_EVERY == 0:
@@ -141,6 +158,12 @@ class TranslateWorker(QThread):
                         )
 
                 self._emit_progress(done_count, total, t0)
+
+            # --- 3.5) 强化翻译统计（让用户能看出这次重译了多少条）---
+            if enhanced and (enh_retried or enh_unresolved):
+                self.log.emit(
+                    f"强化翻译：{enh_retried} 条触发重译，"
+                    f"其中 {enh_unresolved} 条仍未达通顺阈值")
 
             # --- 4) 全部完成 ---
             self.progress.emit(100, "已完成")
